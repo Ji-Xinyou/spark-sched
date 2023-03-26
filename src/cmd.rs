@@ -1,8 +1,14 @@
+use uuid::Uuid;
+
 use std::process::Command;
 
 const DEFAULT_DEPLOY_MODE: &str = "cluster";
 const DEFAULT_NS: &str = "spark";
 const DEFAULT_SERVICE_ACCOUNT: &str = "spark";
+
+/// This is attached per-workload, in the spark-sched custom scheduler, it will find
+/// the pods with the same spark-uuid label, and schedule them as close as possible
+const DEFAULT_NODE_SELECTOR_LABEL_KEY: &str = "spark-uuid";
 
 #[derive(Debug, Default)]
 pub struct PysparkSubmitBuilder {
@@ -20,6 +26,8 @@ pub struct PysparkSubmitBuilder {
     image: Option<String>,
     /// The parallelism of the spark job
     parallelism: Option<u32>,
+    /// The scheduler of the spark job
+    scheduler_name: Option<String>,
     /// The parameters of spark driver
     driver_args: Option<PySparkDriverParams>,
     /// The parameters of spark executor
@@ -40,6 +48,7 @@ impl PysparkSubmitBuilder {
             service_account: None,
             image: None,
             parallelism: None,
+            scheduler_name: None,
             driver_args: None,
             exec_args: None,
             prog: None,
@@ -82,6 +91,11 @@ impl PysparkSubmitBuilder {
         self
     }
 
+    pub fn scheduler(mut self, scheduler: String) -> Self {
+        self.scheduler_name = Some(scheduler);
+        self
+    }
+
     pub fn driver_args(mut self, driver_args: PySparkDriverParams) -> Self {
         self.driver_args = Some(driver_args);
         self
@@ -115,6 +129,7 @@ impl PysparkSubmitBuilder {
                 .unwrap_or_else(|| DEFAULT_SERVICE_ACCOUNT.to_string()),
             image: self.image.unwrap_or_default(),
             parallelism: self.parallelism.unwrap_or_default(),
+            scheduler_name: self.scheduler_name.unwrap_or_default(),
             driver_args: self.driver_args.unwrap_or_default(),
             exec_args: self.exec_args.unwrap_or_default(),
             prog: self.prog.unwrap_or_default(),
@@ -139,6 +154,8 @@ pub struct PySparkSubmit {
     image: String,
     /// The parallelism of the spark job
     parallelism: u32,
+    /// The scheduler name of the spark job
+    scheduler_name: String,
     /// The parameters of spark driver
     driver_args: PySparkDriverParams,
     /// The parameters of spark executor
@@ -151,7 +168,9 @@ pub struct PySparkSubmit {
 
 impl PySparkSubmit {
     pub fn into_command(self) -> PySparkCommand {
-        PySparkCommand::new(&self.path)
+        let id = Uuid::new_v4();
+
+        let mut cmd = PySparkCommand::new(&self.path)
             .add_kv("--master", &self.master)
             .add_kv("--deploy-mode", &self.deploy_mode)
             .add_kv("--name", "spark")
@@ -183,8 +202,27 @@ impl PySparkSubmit {
                 "spark.kubernetes.executor.volumes.persistentVolumeClaim.{}.mount.path={}",
                 self.exec_args.pvc.name, self.exec_args.pvc.mount_path
             ))
-            .arg(&self.prog)
-            .arg(&self.args.join(" "))
+            .add_conf(&format!(
+                "spark.kubernetes.driver.label.{}={}",
+                DEFAULT_NODE_SELECTOR_LABEL_KEY,
+                id.to_string()
+            ))
+            .add_conf(&format!(
+                "spark.kubernetes.executor.label.{}={}",
+                DEFAULT_NODE_SELECTOR_LABEL_KEY,
+                id.to_string()
+            ));
+
+        if !self.scheduler_name.is_empty() {
+            cmd = cmd.add_conf(&format!(
+                "spark.kubernetes.scheduler.name={}",
+                self.scheduler_name
+            ));
+        }
+
+        cmd = cmd.arg(&self.prog).arg(&self.args.join(" "));
+
+        cmd
     }
 }
 

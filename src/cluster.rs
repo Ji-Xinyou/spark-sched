@@ -10,15 +10,31 @@ use kube::{
 #[derive(Debug, Default)]
 pub struct ClusterState {
     /// key: node_name, value: node_state
-    nodes: HashMap<String, NodeState>,
+    pub nodes: HashMap<String, NodeState>,
+    /// the number of cpu core
+    pub total_core: u32,
+    /// the number of memory
+    pub total_mem_mb: u32,
+}
+
+fn reserved_core(nr_node: u32) -> u32 {
+    if nr_node == 1 {
+        2
+    } else {
+        2 + (nr_node - 1)
+    }
+}
+
+fn reserved_mem(nr_node: u32) -> u32 {
+    5 * 1024 * nr_node
 }
 
 #[derive(Debug, Default)]
 pub struct NodeState {
     /// the cpu core
     cpu: u32,
-    /// the memory in kib
-    mem_kib: u32,
+    /// the memory in mb
+    mem_mb: u32,
     /// the network bandwidth to storage node
     network_bandwidth_to_storage: Option<u32>,
     /// key: node_name, value: network_bandwidth
@@ -61,16 +77,22 @@ pub async fn get_cluster_state() -> Result<ClusterState> {
             .chars()
             .filter(|c| c.is_numeric())
             .collect::<String>();
-        let mem_kib = memory_capacity.parse::<u32>().unwrap();
+        let mem_mb = memory_capacity.parse::<u32>().unwrap() / 1024;
 
         let state = NodeState {
             cpu: cpu_capacity.parse::<u32>().unwrap(),
-            mem_kib,
+            mem_mb,
             network_bandwidth_to_storage: None,
             network_bandwidth_to_other_nodes: None,
         };
         cluster_state.nodes.insert(name, state);
+        cluster_state.total_core += cpu_capacity.parse::<u32>().unwrap();
+        cluster_state.total_mem_mb += mem_mb;
     }
+
+    // minus the reserved resources
+    cluster_state.total_core -= reserved_core(cluster_state.nodes.len() as u32);
+    cluster_state.total_mem_mb -= reserved_mem(cluster_state.nodes.len() as u32);
 
     Ok(cluster_state)
 }
