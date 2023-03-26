@@ -96,7 +96,3 @@ pub async fn get_cluster_state() -> Result<ClusterState> {
 
     Ok(cluster_state)
 }
-
-fn hardcoded_network_bandwidth(node_name: String) -> HashMap<String, u32> {
-    todo!()
-}

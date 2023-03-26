@@ -4,8 +4,6 @@ pub trait Planner {
     fn plan(state: &mut ClusterState, n_workload: &mut u32) -> ResourcePlan;
 }
 
-pub struct NetworkAwareFairPlanner;
-
 /// Fair Planner is a planner that treats all workload the same
 /// For example, consider the case below
 ///     node1:         CPU core = 8, Memory = 8G
@@ -20,12 +18,6 @@ pub struct NetworkAwareFairPlanner;
 /// hence it will normally schedule the workload with the most nexec
 pub struct FairPlanner;
 pub struct DefaultPlanner;
-
-impl Planner for NetworkAwareFairPlanner {
-    fn plan(state: &mut ClusterState, n_workload: &mut u32) -> ResourcePlan {
-        return ResourcePlan::default();
-    }
-}
 
 /// estimately the master node uses 2 cpus and 2GB of memory
 /// when we schedule, we need to take that into account
@@ -53,7 +45,7 @@ impl Planner for FairPlanner {
 }
 
 impl Planner for DefaultPlanner {
-    fn plan(state: &mut ClusterState, n_workload: &mut u32) -> ResourcePlan {
+    fn plan(_state: &mut ClusterState, _n_workload: &mut u32) -> ResourcePlan {
         return ResourcePlan::default();
     }
 }

@@ -8,17 +8,17 @@ use cmd::PysparkSubmitBuilder;
 use std::time::Instant;
 
 use crate::cluster::get_cluster_state;
-use crate::resource::{DefaultPlanner, FairPlanner, NetworkAwareFairPlanner, Planner};
+use crate::resource::{DefaultPlanner, FairPlanner, Planner};
 
 /// Notice, the cpu core, memory of driver and executor are not specified by the user
 /// The program will calculate the correct resource(cpu, mem, nexec) to use for the user
 ///
 /// !
-/// ! Also, each workload will be assigned with a universally unique id for the spark-sched to identify
-/// ! the spark-sched will schedule the pods of the wordload as close as possible
+/// ! Also, each workload will be assigned with a universally unique id(UUID) with key "spark-uuid"
+/// ! for the spark-sched to identify, the spark-sched will schedule the pods of the wordload as close as possible
 /// ! The pods deployed here for each load are symmetrical, if some of the pods are deployed on the storage
 /// ! node, they should use more cpu cores on that node
-/// ! 
+/// !
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -74,7 +74,7 @@ struct Args {
     #[arg(long, default_value_t = false)]
     show_log: bool,
 
-    /// which planner to use, (default, fair, networkfair)
+    /// which planner to use, (default, fair)
     #[arg(long, default_value_t = String::from("default"))]
     planner: String,
 
@@ -99,7 +99,6 @@ async fn main() {
     let plannerfunc = match args.planner.as_str() {
         "default" => DefaultPlanner::plan,
         "fair" => FairPlanner::plan,
-        "networkfair" => NetworkAwareFairPlanner::plan,
         _ => DefaultPlanner::plan,
     };
 
