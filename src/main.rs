@@ -1,17 +1,21 @@
+mod cluster;
 mod cmd;
+mod resource;
 
 use clap::Parser;
 use cmd::PysparkSubmitBuilder;
 
 use std::time::Instant;
 
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+use crate::{cluster::get_cluster_state, resource::ResourcePlan};
+
 /// Notice, the cpu core, memory of driver and executor are not specified by the user
 /// The program will calculate the correct resource(cpu, mem, nexec) to use for the user
 ///
 /// Also, each workload will be assigned with a universally unique id for the spark-sched to identify
 /// the spark-sched will schedule the pods of the wordload as close as possible
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
 struct Args {
     /// the number of workload to be run
     #[arg(long, default_value_t = 1)]
@@ -66,18 +70,24 @@ struct Args {
     args: Vec<String>,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args = Args::parse();
     let mut cmds = vec![];
+    let mut state = get_cluster_state().await.unwrap();
 
     println!("Running {} workloads", args.n_workload);
+    println!("Cluster state: {:#?}", state);
 
     for _ in 0..args.n_workload {
-        let driver_cpu = "1";
-        let driver_mem = "1G";
-        let nexec = "4";
-        let exec_cpu = "1";
-        let exec_mem = "1G";
+        // let plan = plan(&mut state);
+        let plan = ResourcePlan::default();
+
+        let driver_cpu = plan.driver_cpu();
+        let driver_mem = plan.driver_mem_gb();
+        let exec_cpu = plan.exec_cpu();
+        let exec_mem = plan.exec_mem_gb();
+        let nexec = plan.nexec();
 
         let driver_args = cmd::PySparkDriverParams {
             core: String::from(driver_cpu),
