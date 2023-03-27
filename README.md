@@ -1,6 +1,10 @@
 # spark-toolbox
 A toolbox for minimal spark submission and scheduling
 ## Scheduler
+The scheduler is still wip, every submission should
+* Clean all pods under namespace **spark**
+* At least gaps 1 second
+
 
 ## Submitter
 Example:
