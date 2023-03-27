@@ -8,47 +8,106 @@ use kube::{
     Client,
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::ops::{EmitParameters, PodBindParameters};
-use crate::predprio::{Predicate, Priority, RandomPredicate, RandomPriority};
+use crate::predprio::{EnoughResourcePredicate, Predicate, Priority, RandomPriority};
 
 const SCHEDULER_NAME: &str = "spark-sched";
 const SPARK_NAMESPACE: &str = "spark";
 
+/// The allocation scene, the semantic is that #nr pods are allocated to #node
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Alloc {
     node: String,
     nr: i32,
 }
 
+#[derive(Debug, Default, Clone)]
+pub(crate) struct NodeResource {
+    pub(crate) cpu: u32,
+    pub(crate) mem_kb: u32,
+}
+
+/// use uuid as key, the vector of alloc is explained below
+///
+/// Each spark job has a uuid string with key spark-uuid (can be seen in spark-submmiter/src/cmd.rs)
+/// with the uuid string as key, you can query the allocation history of the job.
+/// The Scheduler bookkeeps the allocation history, each entry of Vec<Alloc> corresponds to a node
+/// and the number of pods allocated to it.
 pub(crate) type SchedHistory = HashMap<String, Vec<Alloc>>;
 
 pub(crate) struct Scheduler {
     pub(crate) client: Client,
     pub(crate) namespace: String,
-    pub(crate) node_list: Arc<RwLock<Vec<Node>>>,
-    pub(crate) predicates: Vec<Arc<dyn Predicate>>,
-    pub(crate) priorities: Vec<Arc<dyn Priority>>,
-    pub(crate) prev_sched: SchedHistory,
+    pub(crate) predicate: Arc<dyn Predicate>,
+    pub(crate) priority: Arc<dyn Priority>,
+
+    pub(crate) node_resource_map: Mutex<HashMap<String, NodeResource>>,
+    pub(crate) prev_sched: RwLock<SchedHistory>,
 }
 
 impl Scheduler {
     pub async fn new(client: Client) -> Self {
+        let node_resource_map = Mutex::new(HashMap::new());
+
         // Get a node list
         let node_api: Api<Node> = Api::all(client.clone());
         let nodes = node_api.list(&ListParams::default()).await.unwrap().items;
+        for n in nodes {
+            let name = n.metadata.name.unwrap();
+            let mut cpu = n
+                .status
+                .as_ref()
+                .and_then(|status| {
+                    status
+                        .allocatable
+                        .as_ref()
+                        .and_then(|allocatable| allocatable.get("cpu").map(|cpu| &cpu.0))
+                })
+                .expect("(ABNORMAL) failed to get cpu capacity")
+                .parse::<u32>()
+                .unwrap();
+
+            // HACK: master node reserves more..
+            if &name == "node02" {
+                cpu -= 1;
+            }
+
+            let mem_kb =
+                n.status
+                    .as_ref()
+                    .and_then(|status| {
+                        status.allocatable.as_ref().and_then(|allocatable| {
+                            allocatable.get("memory").map(|memory| &memory.0)
+                        })
+                    })
+                    .expect("(ABNORMAL) failed to get memory capacity")
+                    .chars()
+                    .filter(|c| c.is_numeric())
+                    .collect::<String>()
+                    .parse::<u32>()
+                    .unwrap();
+
+            node_resource_map.lock().await.insert(
+                name,
+                NodeResource {
+                    cpu: cpu - 1,
+                    mem_kb: mem_kb - 5 * 1024 * 1024,
+                },
+            );
+        }
 
         Scheduler {
             client,
             namespace: SPARK_NAMESPACE.to_string(),
-            node_list: Arc::new(RwLock::new(nodes)),
-            predicates: vec![Arc::new(RandomPredicate::default())],
-            priorities: vec![Arc::new(RandomPriority::default())],
-            prev_sched: HashMap::new(),
+            predicate: Arc::new(EnoughResourcePredicate::default()),
+            priority: Arc::new(RandomPriority::default()),
+            prev_sched: RwLock::new(HashMap::new()),
+            node_resource_map,
         }
     }
 
@@ -109,40 +168,19 @@ impl Scheduler {
 
         println!("found a pod to schedule: {}/{}", &pod_namespace, &pod_name);
 
-        let node_name = self.find_best_node_for(&pod).await;
+        let node_name = self.eval_and_bind(&pod).await;
         if node_name.is_err() {
-            println!(
-                "cannot find node that fits pod {}/{}: {}",
-                &pod_namespace,
-                &pod_name,
-                node_name.err().unwrap()
-            );
             return false;
         }
-
-        // bind the pod to the node
         let node_name = node_name.unwrap();
-        let bind_params = PodBindParameters {
-            node_name: node_name.clone(),
-            pod: pod.clone(),
-            scheduler_name: SCHEDULER_NAME.to_string(),
-        };
-        let bind_result = self.bind_pod_to_node(bind_params).await;
-        if bind_result.is_err() {
-            println!(
-                "failed to bind pod {}/{}: {}",
-                &pod_namespace,
-                &pod_name,
-                bind_result.err().unwrap()
-            );
-            return false;
-        }
 
         let message = format!(
             "Placed pod [{}/{}] on {}\n",
             &pod_namespace, &pod_name, &node_name
         );
         println!("{}", &message.trim_end());
+
+        self.update_sched_hist();
 
         // emit the event the the pod has been binded
         let emit_params = EmitParameters {
@@ -164,15 +202,17 @@ impl Scheduler {
 
 // utilities
 impl Scheduler {
-    async fn find_best_node_for(&self, pod: &Pod) -> Result<String> {
-        let nodes = self.node_list.clone();
-        let nodes = nodes.read().await;
+    fn update_sched_hist(&self) {
+        //todo
+    }
 
-        println!("Before filtering we have {} nodes", nodes.len());
-        let filtered_nodes = self.predicate_filtered_nodes(pod, &nodes);
-        println!("After filtering we have {} nodes", filtered_nodes.len());
+    async fn eval_and_bind(&self, pod: &Pod) -> Result<String> {
+        let mut node_resource_map = self.node_resource_map.lock().await;
 
-        if filtered_nodes.is_empty() {
+        let pod_resource = pod_resource(pod);
+        let filtered_node_names = self.predicate.judge(&node_resource_map, pod_resource).await;
+
+        if filtered_node_names.is_empty() {
             return Err(anyhow!(format!(
                 "failed to find node that fits pod {}/{}",
                 pod.metadata.namespace.as_ref().unwrap(),
@@ -180,42 +220,52 @@ impl Scheduler {
             )));
         }
 
-        let priorities = self.prioritize(&filtered_nodes, pod, &self.prev_sched, &self.priorities);
+        let prev_sched = self.prev_sched.read().await;
+        let priorities = self.prioritize(&filtered_node_names, pod, &prev_sched);
         let best_node = self.find_best_node(&priorities);
-        Ok(best_node)
-    }
 
-    fn predicate_filtered_nodes(&self, pod: &Pod, nodes: &[Node]) -> Vec<Node> {
-        nodes
-            .into_iter()
-            .filter(|node| self.predicate_ok(pod, node))
-            .cloned()
-            .collect()
-    }
+        // bind the pod to the node
+        let bind_params = PodBindParameters {
+            node_name: best_node.clone(),
+            pod: pod.clone(),
+            scheduler_name: SCHEDULER_NAME.to_string(),
+        };
+        let bind_result = self.bind_pod_to_node(bind_params).await;
 
-    fn predicate_ok(&self, pod: &Pod, node: &Node) -> bool {
-        for predicate in &self.predicates {
-            if !predicate.predicate(node, pod) {
-                return false;
+        let pod_name = pod.metadata.name.as_ref().expect("empty pod name");
+        let pod_namespace = pod
+            .metadata
+            .namespace
+            .as_ref()
+            .expect("empty pod namespace");
+
+        match bind_result {
+            Ok(_) => {
+                // update node resource map
+                node_resource_map.get_mut(&best_node).unwrap().cpu -= pod_resource.cpu;
+                node_resource_map.get_mut(&best_node).unwrap().mem_kb -= pod_resource.mem_kb;
+            }
+            Err(e) => {
+                println!(
+                    "failed to bind pod {}/{} to node {}: {}",
+                    &pod_namespace, &pod_name, &best_node, e
+                );
             }
         }
-        true
+
+        Ok(best_node)
     }
 
     fn prioritize(
         &self,
-        nodes: &[Node],
+        node_names: &[String],
         pod: &Pod,
         prev_sched: &SchedHistory,
-        priorities: &[Arc<dyn Priority>],
     ) -> HashMap<String, i32> {
         let mut result = HashMap::new();
-        for node in nodes {
-            let mut score = 0;
-            for priority in priorities {
-                score += priority.priority(node, pod, prev_sched);
-            }
-            result.insert(node.metadata.name.clone().unwrap(), score);
+        for node_name in node_names {
+            let score = self.priority.priority(node_name, pod, prev_sched);
+            result.insert(node_name.clone(), score);
         }
         result
     }
@@ -231,4 +281,38 @@ impl Scheduler {
         }
         best_node
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PodResource {
+    pub(crate) cpu: u32,
+    pub(crate) mem_kb: u32,
+}
+
+pub(crate) fn pod_resource(pod: &Pod) -> PodResource {
+    let pod_req = pod
+        .spec
+        .as_ref()
+        .unwrap()
+        .containers
+        .get(0)
+        .unwrap()
+        .resources
+        .as_ref()
+        .unwrap()
+        .requests
+        .as_ref()
+        .unwrap();
+
+    let cpu = pod_req.get("cpu").unwrap().0.parse::<u32>().unwrap();
+    let mem_kb = pod_req
+        .get("memory")
+        .unwrap()
+        .0
+        .chars()
+        .filter(|c| c.is_numeric())
+        .collect::<String>()
+        .parse::<u32>()
+        .unwrap();
+    PodResource { cpu, mem_kb }
 }
