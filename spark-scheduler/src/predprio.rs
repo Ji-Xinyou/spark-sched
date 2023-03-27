@@ -51,13 +51,36 @@ impl Predicate for EnoughResourcePredicate {
 #[derive(Debug, Default)]
 pub(crate) struct RandomPriority;
 
+/// Gang Priority is a priority function that prioritizes nodes based on the
+/// sched history of the pods. For those with the same uuid, we give me highest
+/// priority to the node that has the most pods with the same uuid.
+///
+/// todo: consider network
 #[derive(Debug, Default)]
 pub(crate) struct GangPriority;
+
+/// Based on GangPriority, this also takes network speed into account, it will give the
+/// highest priority to the pod that has the fastest network bandwidth with the storage node.
+/// It also consider the network speed between candidate node and the nodes having its peer.
+#[derive(Debug, Default)]
+pub(crate) struct NetworkAwareGangPriority;
 
 impl Priority for RandomPriority {
     fn priority(&self, _node_name: &str, _pod: &Pod, _prev_sched: &SchedHistory) -> i32 {
         let mut rng = rand::thread_rng();
         let random_int = rng.gen_range(0..=100);
         random_int
+    }
+}
+
+impl Priority for GangPriority {
+    fn priority(&self, _node_name: &str, _pod: &Pod, _prev_sched: &SchedHistory) -> i32 {
+        unimplemented!()
+    }
+}
+
+impl Priority for NetworkAwareGangPriority {
+    fn priority(&self, _node_name: &str, _pod: &Pod, _prev_sched: &SchedHistory) -> i32 {
+        unimplemented!()
     }
 }
