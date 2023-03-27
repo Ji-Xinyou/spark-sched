@@ -2,24 +2,21 @@ mod ops;
 mod predprio;
 mod sched;
 
-use anyhow::Result;
 use kube::Client;
-use tokio::time::{sleep, Duration};
 
 use sched::Scheduler;
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let client = Client::try_default().await?;
+async fn main() {
+    let client = Client::try_default()
+        .await
+        .expect("failed to create client");
 
-    tokio::spawn(async move {
-        Scheduler::new_and_then_run(client)
+    let handle = tokio::spawn(async move {
+        Scheduler::run(client)
             .await
             .expect("failed to run scheduler");
     });
 
-    // block
-    loop {
-        sleep(Duration::from_secs(1)).await;
-    }
+    handle.await.expect("join handle panicked");
 }

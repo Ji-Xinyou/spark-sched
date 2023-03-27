@@ -1285,6 +1285,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "kube-runtime",
+ "rand",
  "tokio",
 ]
 

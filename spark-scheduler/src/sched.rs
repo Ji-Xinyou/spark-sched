@@ -7,14 +7,14 @@ use kube::{
     runtime::{watcher, WatchStreamExt},
     Client,
 };
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::sync::RwLock;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::ops::{EmitParameters, PodBindParameters};
-use crate::predprio::{Predicate, Priority};
+use crate::predprio::{Predicate, Priority, RandomPredicate, RandomPriority};
 
 const SCHEDULER_NAME: &str = "spark-sched";
 const SPARK_NAMESPACE: &str = "spark";
@@ -27,10 +27,9 @@ pub(crate) struct Alloc {
 
 pub(crate) type SchedHistory = HashMap<String, Vec<Alloc>>;
 
-pub struct Scheduler {
+pub(crate) struct Scheduler {
     pub(crate) client: Client,
     pub(crate) namespace: String,
-    pub(crate) pod_queue_rx: Option<UnboundedReceiver<Pod>>,
     pub(crate) node_list: Arc<RwLock<Vec<Node>>>,
     pub(crate) predicates: Vec<Arc<dyn Predicate>>,
     pub(crate) priorities: Vec<Arc<dyn Priority>>,
@@ -38,93 +37,41 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub async fn new_and_then_run(client: Client) -> Result<()> {
-        let (tx, rx) = unbounded_channel();
+    pub async fn run(client: Client) -> Result<()> {
+        let (tx, mut rx) = unbounded_channel();
+
+        // Get a node list
+        let node_api: Api<Node> = Api::all(client.clone());
+        let nodes = node_api.list(&ListParams::default()).await?.items;
 
         let sched = Scheduler {
             client,
             namespace: SPARK_NAMESPACE.to_string(),
-            pod_queue_rx: Some(rx),
-            node_list: Arc::new(RwLock::new(vec![])),
-            predicates: vec![],
-            priorities: vec![],
+            node_list: Arc::new(RwLock::new(nodes)),
+            predicates: vec![Arc::new(RandomPredicate::default())],
+            priorities: vec![Arc::new(RandomPriority::default())],
             prev_sched: HashMap::new(),
         };
 
-        sched.run(tx).await
-    }
-
-    async fn run(mut self, tx: UnboundedSender<Pod>) -> Result<()> {
         // the thread that watches for new pods added event
-        self.start_pod_watcher(tx);
+        sched.start_pod_watcher(tx);
 
-        // the main loop of scheduling
+        let sched = Arc::new(sched);
+
         loop {
-            let rx = self.pod_queue_rx.as_mut().unwrap();
+            println!("Waiting to schedule pod...");
             let pod = rx.recv().await.expect("the pod queue is closed");
+            let sched = sched.clone();
 
-            let pod_name = pod.metadata.name.as_ref().expect("empty pod name");
-            let pod_namespace = pod
-                .metadata
-                .namespace
-                .as_ref()
-                .expect("empty pod namespace");
-
-            println!("found a pod to schedule: {}/{}", &pod_namespace, &pod_name);
-
-            let node_name = self.find_best_node_for(&pod).await;
-            if node_name.is_err() {
-                println!(
-                    "cannot find node that fits pod {}/{}: {}",
-                    &pod_namespace,
-                    &pod_name,
-                    node_name.err().unwrap()
-                );
-                continue;
-            }
-
-            // bind the pod to the node
-            let node_name = node_name.unwrap();
-            let bind_params = PodBindParameters {
-                node_name: node_name.clone(),
-                pod: pod.clone(),
-                scheduler_name: SCHEDULER_NAME.to_string(),
-            };
-            let bind_result = self.bind_pod_to_node(bind_params).await;
-            if bind_result.is_err() {
-                println!(
-                    "failed to bind pod {}/{}: {}",
-                    &pod_namespace,
-                    &pod_name,
-                    bind_result.err().unwrap()
-                );
-                continue;
-            }
-
-            let message = format!(
-                "Placed pod [{}/{}] on {}\n",
-                &pod_namespace, &pod_name, &node_name
-            );
-            println!("{}", &message);
-
-            // emit the event the the pod has been binded
-            let emit_params = EmitParameters {
-                pod,
-                scheduler_name: SCHEDULER_NAME.to_string(),
-                message,
-            };
-            let event_result = self.emit_event(emit_params).await;
-            if event_result.is_err() {
-                println!(
-                    "failed to emit scheduled event: {}",
-                    event_result.err().unwrap()
-                );
-                continue;
-            }
+            tokio::spawn(async move {
+                let ok = sched.sched_pod(pod).await;
+                println!("pod scheduled success??: {}", ok);
+            });
         }
+        // sched.run().await
     }
 
-    fn start_pod_watcher(&mut self, tx: UnboundedSender<Pod>) {
+    fn start_pod_watcher(&self, tx: UnboundedSender<Pod>) {
         // List params to only obtain pods that are unscheduled/not bound to a node and
         // has the specified scheduler name set
         let unscheduled_lp = ListParams::default()
@@ -146,7 +93,71 @@ impl Scheduler {
                 .expect("failed to watch pods");
 
             println!("[NOTICE] the watcher is closed??");
+            unreachable!()
         });
+    }
+
+    /// schedule a pod, return true if the pod is scheduled successfully
+    async fn sched_pod(&self, pod: Pod) -> bool {
+        let pod_name = pod.metadata.name.as_ref().expect("empty pod name");
+        let pod_namespace = pod
+            .metadata
+            .namespace
+            .as_ref()
+            .expect("empty pod namespace");
+
+        println!("found a pod to schedule: {}/{}", &pod_namespace, &pod_name);
+
+        let node_name = self.find_best_node_for(&pod).await;
+        if node_name.is_err() {
+            println!(
+                "cannot find node that fits pod {}/{}: {}",
+                &pod_namespace,
+                &pod_name,
+                node_name.err().unwrap()
+            );
+            return false;
+        }
+
+        // bind the pod to the node
+        let node_name = node_name.unwrap();
+        let bind_params = PodBindParameters {
+            node_name: node_name.clone(),
+            pod: pod.clone(),
+            scheduler_name: SCHEDULER_NAME.to_string(),
+        };
+        let bind_result = self.bind_pod_to_node(bind_params).await;
+        if bind_result.is_err() {
+            println!(
+                "failed to bind pod {}/{}: {}",
+                &pod_namespace,
+                &pod_name,
+                bind_result.err().unwrap()
+            );
+            return false;
+        }
+
+        let message = format!(
+            "Placed pod [{}/{}] on {}\n",
+            &pod_namespace, &pod_name, &node_name
+        );
+        println!("{}", &message);
+
+        // emit the event the the pod has been binded
+        let emit_params = EmitParameters {
+            pod,
+            scheduler_name: SCHEDULER_NAME.to_string(),
+            message,
+        };
+        let event_result = self.emit_event(emit_params).await;
+        if event_result.is_err() {
+            println!(
+                "failed to emit scheduled event: {}",
+                event_result.err().unwrap()
+            );
+        }
+
+        true
     }
 }
 
@@ -155,7 +166,10 @@ impl Scheduler {
     async fn find_best_node_for(&self, pod: &Pod) -> Result<String> {
         let nodes = self.node_list.clone();
         let nodes = nodes.read().await;
+
+        println!("Before filtering we have {} nodes", nodes.len());
         let filtered_nodes = self.predicate_filtered_nodes(pod, &nodes);
+        println!("After filtering we have {} nodes", filtered_nodes.len());
 
         if filtered_nodes.is_empty() {
             return Err(anyhow!(format!(
