@@ -22,7 +22,7 @@ const SPARK_NAMESPACE: &str = "spark";
 /// The allocation scene, the semantic is that #nr pods are allocated to #node
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Alloc {
-    node: String,
+    node_name: String,
     nr: i32,
 }
 
@@ -180,7 +180,17 @@ impl Scheduler {
         );
         println!("{}", &message.trim_end());
 
-        self.update_sched_hist();
+        self.update_sched_hist(
+            pod.clone()
+                .metadata
+                .labels
+                .unwrap()
+                .get("spark-uuid")
+                .unwrap()
+                .clone(),
+            node_name.clone(),
+        )
+        .await;
 
         // emit the event the the pod has been binded
         let emit_params = EmitParameters {
@@ -202,8 +212,28 @@ impl Scheduler {
 
 // utilities
 impl Scheduler {
-    fn update_sched_hist(&self) {
-        //todo
+    async fn update_sched_hist(&self, uuid: String, node_name: String) {
+        let mut hist = self.prev_sched.write().await;
+        let alloc = hist.get_mut(&uuid);
+        match alloc {
+            // a seen spark job, update the alloc
+            Some(alloc_hist) => {
+                for alloc in alloc_hist.iter_mut() {
+                    if alloc.node_name == node_name {
+                        alloc.nr += 1;
+                        return;
+                    }
+                }
+                // not returned, so it is a new node
+                alloc_hist.push(Alloc { node_name, nr: 1 });
+            }
+            // an unseen spark job
+            None => {
+                hist.insert(uuid, vec![Alloc { node_name, nr: 1 }]);
+            }
+        };
+
+        println!("updated sched hist: {:?}", hist);
     }
 
     async fn eval_and_bind(&self, pod: &Pod) -> Result<String> {
