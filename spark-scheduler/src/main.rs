@@ -12,10 +12,10 @@ async fn main() {
         .await
         .expect("failed to create client");
 
+    let sched = Scheduler::new(client).await;
+
     let handle = tokio::spawn(async move {
-        Scheduler::run(client)
-            .await
-            .expect("failed to run scheduler");
+        sched.run().await.expect("scheduler failed");
     });
 
     handle.await.expect("join handle panicked");

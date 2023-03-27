@@ -37,26 +37,28 @@ pub(crate) struct Scheduler {
 }
 
 impl Scheduler {
-    pub async fn run(client: Client) -> Result<()> {
-        let (tx, mut rx) = unbounded_channel();
-
+    pub async fn new(client: Client) -> Self {
         // Get a node list
         let node_api: Api<Node> = Api::all(client.clone());
-        let nodes = node_api.list(&ListParams::default()).await?.items;
+        let nodes = node_api.list(&ListParams::default()).await.unwrap().items;
 
-        let sched = Scheduler {
+        Scheduler {
             client,
             namespace: SPARK_NAMESPACE.to_string(),
             node_list: Arc::new(RwLock::new(nodes)),
             predicates: vec![Arc::new(RandomPredicate::default())],
             priorities: vec![Arc::new(RandomPriority::default())],
             prev_sched: HashMap::new(),
-        };
+        }
+    }
+
+    pub async fn run(self) -> Result<()> {
+        let (tx, mut rx) = unbounded_channel();
 
         // the thread that watches for new pods added event
-        sched.start_pod_watcher(tx);
+        self.start_pod_watcher(tx);
 
-        let sched = Arc::new(sched);
+        let sched = Arc::new(self);
 
         loop {
             println!("Waiting to schedule pod...");
@@ -68,7 +70,6 @@ impl Scheduler {
                 println!("pod scheduled success??: {}", ok);
             });
         }
-        // sched.run().await
     }
 
     fn start_pod_watcher(&self, tx: UnboundedSender<Pod>) {
@@ -141,7 +142,7 @@ impl Scheduler {
             "Placed pod [{}/{}] on {}\n",
             &pod_namespace, &pod_name, &node_name
         );
-        println!("{}", &message);
+        println!("{}", &message.trim_end());
 
         // emit the event the the pod has been binded
         let emit_params = EmitParameters {
