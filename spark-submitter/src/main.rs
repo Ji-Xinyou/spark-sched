@@ -144,6 +144,7 @@ async fn main() {
             .service_account(args.service_account.clone())
             .image(args.image.clone())
             .parallelism(parallelism)
+            .scheduler(args.scheduler_name.clone())
             .driver_args(driver_args)
             .exec_args(exec_args)
             .prog(args.prog.clone())

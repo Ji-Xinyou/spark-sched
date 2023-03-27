@@ -1,2 +1,4 @@
-# spark-submitter
-A planner for submitting spark job in kubernetes working in pvc
+# spark-toolbox
+A toolbox for minimal spark submission and scheduling
+## Scheduler
+## Submitter
