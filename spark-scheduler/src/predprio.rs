@@ -17,7 +17,13 @@ pub(crate) trait Predicate: Send + Sync {
 }
 
 pub(crate) trait Priority: Send + Sync {
-    fn priority(&self, node: &str, pod: &Pod, prev_sched: &SchedHistory) -> i32;
+    fn priority(
+        &self,
+        node: &str,
+        node_resource_map: &HashMap<String, NodeResource>,
+        pod: &Pod,
+        prev_sched: &SchedHistory,
+    ) -> u32;
 }
 
 /// EnoughResourcePredicate filters the nodes that have enough resources to
@@ -44,6 +50,10 @@ impl Predicate for EnoughResourcePredicate {
                 node_names.push(node_name.to_string());
             }
         }
+        println!(
+            "\njudging\n  resource: {:#?}\n  filtered: {:#?}\n",
+            node_resource_map, node_names
+        );
         node_names
     }
 }
@@ -66,7 +76,13 @@ pub(crate) struct GangPriority;
 pub(crate) struct NetworkAwareGangPriority;
 
 impl Priority for RandomPriority {
-    fn priority(&self, _node_name: &str, _pod: &Pod, _prev_sched: &SchedHistory) -> i32 {
+    fn priority(
+        &self,
+        _node_name: &str,
+        _node_resource_map: &HashMap<String, NodeResource>,
+        _pod: &Pod,
+        _prev_sched: &SchedHistory,
+    ) -> u32 {
         let mut rng = rand::thread_rng();
         let random_int = rng.gen_range(0..=100);
         random_int
@@ -74,13 +90,47 @@ impl Priority for RandomPriority {
 }
 
 impl Priority for GangPriority {
-    fn priority(&self, _node_name: &str, _pod: &Pod, _prev_sched: &SchedHistory) -> i32 {
-        unimplemented!()
+    fn priority(
+        &self,
+        node_name: &str,
+        node_resource_map: &HashMap<String, NodeResource>,
+        pod: &Pod,
+        prev_sched: &SchedHistory,
+    ) -> u32 {
+        let uuid = pod
+            .clone()
+            .metadata
+            .labels
+            .unwrap()
+            .get("spark-uuid")
+            .unwrap()
+            .clone();
+
+        // Some pods of this uuid has already been sched, check if the node_name is in it
+        let is_peer_sched = prev_sched.get(&uuid);
+        if is_peer_sched.is_some() {
+            let peer_sched = is_peer_sched.unwrap();
+            for alloc in peer_sched {
+                if alloc.node_name == node_name {
+                    return 100;
+                }
+            }
+        }
+
+        // either no pod of this uuid has been sched, or this node_name has no pod of this uuid
+        // return the one with the most cpu
+        node_resource_map.get(node_name).unwrap().cpu * 10
     }
 }
 
 impl Priority for NetworkAwareGangPriority {
-    fn priority(&self, _node_name: &str, _pod: &Pod, _prev_sched: &SchedHistory) -> i32 {
+    fn priority(
+        &self,
+        _node_name: &str,
+        _node_resource_map: &HashMap<String, NodeResource>,
+        _pod: &Pod,
+        _prev_sched: &SchedHistory,
+    ) -> u32 {
         unimplemented!()
     }
 }

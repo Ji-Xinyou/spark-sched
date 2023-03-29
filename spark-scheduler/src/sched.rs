@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::ops::{EmitParameters, PodBindParameters};
-use crate::predprio::{EnoughResourcePredicate, Predicate, Priority, RandomPriority};
+use crate::predprio::{EnoughResourcePredicate, GangPriority, Predicate, Priority};
 
 const SCHEDULER_NAME: &str = "spark-sched";
 const SPARK_NAMESPACE: &str = "spark";
@@ -23,8 +23,8 @@ const DEFAULT_MASTER_NODE_NAME: &str = "node02";
 /// The allocation scene, the semantic is that #nr pods are allocated to #node
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Alloc {
-    node_name: String,
-    nr: i32,
+    pub(crate) node_name: String,
+    pub(crate) nr: i32,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -59,7 +59,7 @@ impl Scheduler {
             client,
             namespace: SPARK_NAMESPACE.to_string(),
             predicate: Arc::new(EnoughResourcePredicate::default()),
-            priority: Arc::new(RandomPriority::default()),
+            priority: Arc::new(GangPriority::default()),
             prev_sched: RwLock::new(HashMap::new()),
             node_resource_map,
         };
@@ -87,10 +87,10 @@ impl Scheduler {
             tokio::spawn(async move {
                 let ok = sched.sched_pod(&pod).await;
                 // if failed to schedule, put it back to the rx
-                if !ok {
-                    let tx = tx_c.clone();
-                    tx.send(pod).unwrap();
-                }
+                // if !ok {
+                //     let tx = tx_c.clone();
+                //     tx.send(pod).unwrap();
+                // }
                 println!("pod scheduled success??: {}", ok);
             });
         }
@@ -195,6 +195,7 @@ impl Scheduler {
                 for alloc in alloc_hist.iter_mut() {
                     if alloc.node_name == node_name {
                         alloc.nr += 1;
+                        println!("updated sched hist: {:?}", hist);
                         return;
                     }
                 }
@@ -284,7 +285,8 @@ impl Scheduler {
         }
 
         let prev_sched = self.prev_sched.read().await;
-        let priorities = self.prioritize(&filtered_node_names, pod, &prev_sched);
+        let priorities =
+            self.prioritize(&filtered_node_names, &node_resource_map, pod, &prev_sched);
         let best_node = self.find_best_node(&priorities);
 
         // bind the pod to the node
@@ -322,19 +324,22 @@ impl Scheduler {
     fn prioritize(
         &self,
         node_names: &[String],
+        node_resource_map: &HashMap<String, NodeResource>,
         pod: &Pod,
         prev_sched: &SchedHistory,
-    ) -> HashMap<String, i32> {
+    ) -> HashMap<String, u32> {
         let mut result = HashMap::new();
         for node_name in node_names {
-            let score = self.priority.priority(node_name, pod, prev_sched);
+            let score = self
+                .priority
+                .priority(node_name, node_resource_map, pod, prev_sched);
             result.insert(node_name.clone(), score);
         }
         result
     }
 
-    fn find_best_node(&self, priorities: &HashMap<String, i32>) -> String {
-        let mut max_p = i32::MIN;
+    fn find_best_node(&self, priorities: &HashMap<String, u32>) -> String {
+        let mut max_p = 0;
         let mut best_node = String::new();
         for (node, p) in priorities {
             if *p > max_p {
