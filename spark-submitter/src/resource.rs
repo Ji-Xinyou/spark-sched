@@ -1,7 +1,14 @@
 use crate::cluster::ClusterState;
 
+pub enum WorkloadType {
+    /// the workload mainly uses cpu, use bandwidth less
+    Compute,
+    /// the workload mainly uses bandwidth, use less cpu, often takes more time
+    Storage,
+}
+
 pub trait Planner {
-    fn plan(state: &mut ClusterState, n_workload: &mut u32) -> ResourcePlan;
+    fn plan(state: &mut ClusterState, n_workload: &mut u32, ty: WorkloadType) -> ResourcePlan;
 }
 
 /// Fair Planner is a planner that treats all workload the same
@@ -19,10 +26,12 @@ pub trait Planner {
 pub struct FairPlanner;
 pub struct DefaultPlanner;
 
+pub struct WorkloadAwareFairPlanner;
+
 /// estimately the master node uses 2 cpus and 2GB of memory
 /// when we schedule, we need to take that into account
 impl Planner for FairPlanner {
-    fn plan(state: &mut ClusterState, n_workload: &mut u32) -> ResourcePlan {
+    fn plan(state: &mut ClusterState, n_workload: &mut u32, _ty: WorkloadType) -> ResourcePlan {
         let core = state.total_core / *n_workload;
         let mem_mb = state.total_mem_mb / *n_workload;
         *n_workload -= 1;
@@ -45,7 +54,7 @@ impl Planner for FairPlanner {
 }
 
 impl Planner for DefaultPlanner {
-    fn plan(_state: &mut ClusterState, _n_workload: &mut u32) -> ResourcePlan {
+    fn plan(_state: &mut ClusterState, _n_workload: &mut u32, _ty: WorkloadType) -> ResourcePlan {
         return ResourcePlan::default();
     }
 }
@@ -81,7 +90,7 @@ impl ResourcePlan {
     }
 
     pub fn exec_cpu(&self) -> String {
-        self.exec_cpu.to_string()
+        format!("{}m", self.exec_cpu.to_string())
     }
 
     pub fn exec_mem_mb(&self) -> String {

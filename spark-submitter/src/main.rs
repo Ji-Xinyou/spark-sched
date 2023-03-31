@@ -23,10 +23,6 @@ use crate::resource::{DefaultPlanner, FairPlanner, Planner};
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// the number of workload to be run
-    #[arg(long, default_value_t = 1)]
-    n_workload: u32,
-
     /// the spark-submit path
     #[arg(long)]
     path: String,
@@ -63,13 +59,14 @@ struct Args {
     #[arg(long, default_value_t = String::from("/mnt"))]
     pvc_mount_path: String,
 
-    /// the program executable(or script) to run
-    #[arg(long)]
-    prog: String,
+    /// tags, which will be used to identify the workload, it HAS TO BE
+    /// IN THE SAME ORDER as the progs
+    #[arg(long, value_parser, num_args = 1..,)]
+    tags: Vec<String>,
 
-    /// the argument of the program
-    #[arg(long)]
-    args: Vec<String>,
+    /// the programs executable(or script) to run with its argument
+    #[arg(long, value_parser, num_args = 1..,)]
+    progs: Vec<String>,
 
     /// whether to show log in the stdio
     #[arg(long, default_value_t = false)]
@@ -92,8 +89,12 @@ async fn main() {
     let args = Args::parse();
     let mut cmds = vec![];
     let mut state = get_cluster_state().await.unwrap();
+    let mut n_workload = args.progs.len() as u32;
 
-    println!("\nRunning {} workloads", args.n_workload);
+    // has to be the same
+    assert_eq!(n_workload, args.tags.len() as u32);
+
+    println!("\nRunning {} workloads", n_workload);
     println!("Cluster state: {:#?}", state);
 
     println!("Using {} planner", args.planner);
@@ -104,10 +105,15 @@ async fn main() {
     };
 
     let parallelism = parallelism_func(state.total_core);
-    let mut n_workload = args.n_workload;
 
-    for i in 0..args.n_workload {
-        let plan = plannerfunc(&mut state, &mut n_workload);
+    for (i, prog) in args.progs.iter().enumerate() {
+        let workload_type = match args.tags[i].as_str() {
+            "compute" => resource::WorkloadType::Compute,
+            "storage" => resource::WorkloadType::Storage,
+            _ => panic!("Unknown workload type: {}", args.tags[i]),
+        };
+
+        let plan = plannerfunc(&mut state, &mut n_workload, workload_type);
         println!("For the {}-th workload, emitting plan: {:#?}", i, &plan);
 
         let driver_cpu = plan.driver_cpu();
@@ -148,8 +154,7 @@ async fn main() {
             .scheduler(args.scheduler_name.clone())
             .driver_args(driver_args)
             .exec_args(exec_args)
-            .prog(args.prog.clone())
-            .args(args.args.clone())
+            .prog(prog.clone())
             .build()
             .into_command();
 
@@ -169,6 +174,7 @@ async fn main() {
     let mut childs = vec![];
     for mut cmd in cmds {
         println!("Spawning one workload");
+        println!("cmd: {:?}", cmd.cmd.get_args());
         childs.push(cmd.cmd.spawn().unwrap());
     }
 

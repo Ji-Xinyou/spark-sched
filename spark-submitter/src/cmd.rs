@@ -34,8 +34,6 @@ pub struct PysparkSubmitBuilder {
     exec_args: Option<PySparkExecutorParams>,
     /// The program executable(or script) to run
     prog: Option<String>,
-    /// The argument of the program
-    args: Option<Vec<String>>,
 }
 
 impl PysparkSubmitBuilder {
@@ -52,7 +50,6 @@ impl PysparkSubmitBuilder {
             driver_args: None,
             exec_args: None,
             prog: None,
-            args: None,
         }
     }
 
@@ -111,11 +108,6 @@ impl PysparkSubmitBuilder {
         self
     }
 
-    pub fn args(mut self, args: Vec<String>) -> Self {
-        self.args = Some(args);
-        self
-    }
-
     pub fn build(self) -> PySparkSubmit {
         PySparkSubmit {
             path: self.path.unwrap_or_default(),
@@ -133,7 +125,6 @@ impl PysparkSubmitBuilder {
             driver_args: self.driver_args.unwrap_or_default(),
             exec_args: self.exec_args.unwrap_or_default(),
             prog: self.prog.unwrap_or_default(),
-            args: self.args.unwrap_or_default(),
         }
     }
 }
@@ -162,8 +153,6 @@ pub struct PySparkSubmit {
     exec_args: PySparkExecutorParams,
     /// The program executable(or script) to run
     prog: String,
-    /// The argument of the program
-    args: Vec<String>,
 }
 
 impl PySparkSubmit {
@@ -220,8 +209,10 @@ impl PySparkSubmit {
             ));
         }
 
-        cmd = cmd.arg(&self.prog).arg(&self.args.join(" "));
-
+        let prog: Vec<&str> = self.prog.split(' ').collect();
+        for arg in prog.iter() {
+            cmd = cmd.arg(arg);
+        }
         cmd
     }
 }
