@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::ops::{EmitParameters, PodBindParameters};
-use crate::predprio::{EnoughResourcePredicate, GangPriority, Predicate, Priority};
+use crate::predprio::{EnoughResourcePredicate, Predicate, Priority};
 
 const SCHEDULER_NAME: &str = "spark-sched";
 const SPARK_NAMESPACE: &str = "spark";
@@ -44,8 +44,12 @@ pub(crate) type SchedHistory = HashMap<String, Vec<Alloc>>;
 pub(crate) struct Scheduler {
     pub(crate) client: Client,
     pub(crate) namespace: String,
+
     pub(crate) predicate: Arc<dyn Predicate>,
     pub(crate) priority: Arc<dyn Priority>,
+
+    pub(crate) bandwidth_map: HashMap<(String, String), u32>,
+    pub(crate) next_choice: RwLock<HashMap<String, u32>>,
 
     pub(crate) node_resource_map: Mutex<HashMap<String, NodeResource>>,
     pub(crate) prev_sched: RwLock<SchedHistory>,
@@ -59,7 +63,9 @@ impl Scheduler {
             client,
             namespace: SPARK_NAMESPACE.to_string(),
             predicate: Arc::new(EnoughResourcePredicate::default()),
-            priority: Arc::new(GangPriority::default()),
+            priority: Arc::new(crate::predprio::NetworkAwarePriority::default()),
+            bandwidth_map: hard_coded_network_bandwidth_map(),
+            next_choice: RwLock::new(HashMap::new()),
             prev_sched: RwLock::new(HashMap::new()),
             node_resource_map,
         };
@@ -154,17 +160,16 @@ impl Scheduler {
         );
         println!("{}", &message.trim_end());
 
-        self.update_sched_hist(
-            pod.clone()
-                .metadata
-                .labels
-                .unwrap()
-                .get("spark-uuid")
-                .unwrap()
-                .clone(),
-            node_name.clone(),
-        )
-        .await;
+        let uuid = pod
+            .clone()
+            .metadata
+            .labels
+            .unwrap()
+            .get("spark-uuid")
+            .unwrap()
+            .clone();
+
+        self.update_sched_hist(uuid, node_name).await;
 
         // emit the event the the pod has been binded
         let emit_params = EmitParameters {
@@ -216,6 +221,8 @@ impl Scheduler {
         let pods = pods.list(&ListParams::default()).await.unwrap().items;
         if pods.is_empty() {
             self.renew_resource_map().await;
+            self.prev_sched.write().await.clear();
+            self.next_choice.write().await.clear();
             println!("Node resource map renewed!");
         }
     }
@@ -242,7 +249,7 @@ impl Scheduler {
 
             // HACK: master node reserves more..
             if &name == DEFAULT_MASTER_NODE_NAME {
-                cpu -= 1;
+                cpu -= 2;
             }
 
             let mem_kb =
@@ -285,8 +292,14 @@ impl Scheduler {
         }
 
         let prev_sched = self.prev_sched.read().await;
-        let priorities =
-            self.prioritize(&filtered_node_names, &node_resource_map, pod, &prev_sched);
+        let mut choice = self.next_choice.write().await;
+        let priorities = self.prioritize(
+            &filtered_node_names,
+            &node_resource_map,
+            pod,
+            &mut choice,
+            &prev_sched,
+        );
         let best_node = self.find_best_node(&priorities);
 
         // bind the pod to the node
@@ -326,16 +339,17 @@ impl Scheduler {
         node_names: &[String],
         node_resource_map: &HashMap<String, NodeResource>,
         pod: &Pod,
+        choice: &mut HashMap<String, u32>,
         prev_sched: &SchedHistory,
     ) -> HashMap<String, u32> {
-        let mut result = HashMap::new();
-        for node_name in node_names {
-            let score = self
-                .priority
-                .priority(node_name, node_resource_map, pod, prev_sched);
-            result.insert(node_name.clone(), score);
-        }
-        result
+        self.priority.priority(
+            node_names,
+            node_resource_map,
+            pod,
+            &self.bandwidth_map.clone(),
+            choice,
+            prev_sched,
+        )
     }
 
     fn find_best_node(&self, priorities: &HashMap<String, u32>) -> String {
@@ -383,4 +397,45 @@ pub(crate) fn pod_resource(pod: &Pod) -> PodResource {
         .parse::<u32>()
         .unwrap();
     PodResource { cpu, mem_kb }
+}
+
+pub(crate) fn hard_coded_network_bandwidth_map() -> HashMap<(String, String), u32> {
+    let node1 = String::from("node1");
+    let node2 = String::from("node02");
+    let node3 = String::from("node03");
+    let node4 = String::from("xyji");
+
+    let b12 = 100;
+    let b13 = 100;
+    let b14 = 5;
+    let b23 = 100;
+    let b24 = 20;
+    let b34 = 25;
+
+    let mut map = HashMap::new();
+    map.insert((node1.clone(), node2.clone()), b12);
+    map.insert((node2.clone(), node1.clone()), b12);
+
+    map.insert((node1.clone(), node3.clone()), b13);
+    map.insert((node3.clone(), node1.clone()), b13);
+
+    map.insert((node1.clone(), node4.clone()), b14);
+    map.insert((node4.clone(), node1.clone()), b14);
+
+    map.insert((node2.clone(), node3.clone()), b23);
+    map.insert((node3.clone(), node2.clone()), b23);
+
+    map.insert((node2.clone(), node4.clone()), b24);
+    map.insert((node4.clone(), node2.clone()), b24);
+
+    map.insert((node3.clone(), node4.clone()), b34);
+    map.insert((node4.clone(), node3.clone()), b34);
+
+    for n in [node1, node2, node3, node4] {
+        map.insert((n.clone(), n.clone()), u32::MAX);
+    }
+
+    println!("bandwidth map: {:?}", map);
+
+    map
 }

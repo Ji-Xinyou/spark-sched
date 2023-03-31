@@ -2,6 +2,7 @@ mod cluster;
 mod cmd;
 mod resource;
 
+use awaitgroup::WaitGroup;
 use clap::Parser;
 use cmd::PysparkSubmitBuilder;
 
@@ -171,23 +172,29 @@ async fn main() {
         childs.push(cmd.cmd.spawn().unwrap());
     }
 
-    let elapsed_ms = measure(|| {
-        for mut child in childs {
-            child.wait().unwrap();
-        }
-    });
-
-    println!("\nSubmitter exits, elapsed time: {} ms", elapsed_ms);
+    let mut wg = WaitGroup::new();
+    for mut child in childs {
+        let worker = wg.worker();
+        tokio::spawn(async move {
+            measure(|| {
+                child.wait().unwrap();
+            });
+            worker.done();
+        });
+    }
+    wg.wait().await;
 }
 
-fn measure<F>(f: F) -> u128
+fn measure<F>(f: F)
 where
     F: FnOnce(),
 {
     let start_time = Instant::now();
     f();
     let end_time = Instant::now();
-    (end_time - start_time).as_millis()
+
+    let e = (end_time - start_time).as_millis();
+    println!("One workload exits, elapsed time: {} ms", e);
 }
 
 fn parallelism_func(total_core: u32) -> u32 {
