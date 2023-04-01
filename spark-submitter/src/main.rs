@@ -9,7 +9,7 @@ use cmd::PysparkSubmitBuilder;
 use std::time::Instant;
 
 use crate::cluster::get_cluster_state;
-use crate::resource::{DefaultPlanner, FairPlanner, Planner};
+use crate::resource::{FairPlanner, Planner, WorkloadAwareFairPlanner};
 
 /// Notice, the cpu core, memory of driver and executor are not specified by the user
 /// The program will calculate the correct resource(cpu, mem, nexec) to use for the user
@@ -89,7 +89,7 @@ async fn main() {
     let args = Args::parse();
     let mut cmds = vec![];
     let mut state = get_cluster_state().await.unwrap();
-    let mut n_workload = args.progs.len() as u32;
+    let n_workload = args.progs.len() as u32;
 
     // has to be the same
     assert_eq!(n_workload, args.tags.len() as u32);
@@ -99,21 +99,30 @@ async fn main() {
 
     println!("Using {} planner", args.planner);
     let plannerfunc = match args.planner.as_str() {
-        "default" => DefaultPlanner::plan,
         "fair" => FairPlanner::plan,
-        _ => DefaultPlanner::plan,
+        "workload" => WorkloadAwareFairPlanner::plan,
+        _ => panic!("Unknown planner: {}", args.planner)
     };
 
-    let parallelism = parallelism_func(state.total_core);
-
-    for (i, prog) in args.progs.iter().enumerate() {
-        let workload_type = match args.tags[i].as_str() {
+    let workload_types = args.tags.iter().map(|t| {
+        match t.as_str() {
             "compute" => resource::WorkloadType::Compute,
             "storage" => resource::WorkloadType::Storage,
-            _ => panic!("Unknown workload type: {}", args.tags[i]),
-        };
+            _ => panic!("Unknown workload type: {}", t),
+        }
+    }).collect::<Vec<resource::WorkloadType>>();
 
-        let plan = plannerfunc(&mut state, &mut n_workload, workload_type);
+    let workload_types = if workload_types.is_empty() {
+        vec![resource::WorkloadType::Compute; n_workload as usize]
+    } else {
+        workload_types
+    };
+
+    let plans = plannerfunc(&mut state, workload_types);
+
+    let parallelism = parallelism_func(state.total_core);
+    for (i, prog) in args.progs.iter().enumerate() {
+        let plan = plans[i];
         println!("For the {}-th workload, emitting plan: {:#?}", i, &plan);
 
         let driver_cpu = plan.driver_cpu();

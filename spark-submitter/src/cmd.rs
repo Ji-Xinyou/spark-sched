@@ -10,6 +10,11 @@ const DEFAULT_SERVICE_ACCOUNT: &str = "spark";
 /// the pods with the same spark-uuid label, and schedule them as close as possible
 const DEFAULT_NODE_SELECTOR_LABEL_KEY: &str = "spark-uuid";
 
+/// This is attached per-workload, in the spark-sched custom scheduler, it will
+/// see that this workload type and make scheduling decisions accordingly
+/// e.g. "compute", "storage"
+const DEFAULT_WORKLOAD_TYPE_KEY: &str = "spark-workload-type";
+
 #[derive(Debug, Default)]
 pub struct PysparkSubmitBuilder {
     /// The spark-submit path
@@ -32,6 +37,8 @@ pub struct PysparkSubmitBuilder {
     driver_args: Option<PySparkDriverParams>,
     /// The parameters of spark executor
     exec_args: Option<PySparkExecutorParams>,
+    /// The workload type
+    workload_type: Option<String>,
     /// The program executable(or script) to run
     prog: Option<String>,
 }
@@ -49,6 +56,7 @@ impl PysparkSubmitBuilder {
             scheduler_name: None,
             driver_args: None,
             exec_args: None,
+            workload_type: None,
             prog: None,
         }
     }
@@ -103,6 +111,11 @@ impl PysparkSubmitBuilder {
         self
     }
 
+    pub fn workload_type(mut self, workload_type: String) -> Self {
+        self.workload_type = Some(workload_type);
+        self
+    }
+
     pub fn prog(mut self, prog: String) -> Self {
         self.prog = Some(prog);
         self
@@ -124,6 +137,7 @@ impl PysparkSubmitBuilder {
             scheduler_name: self.scheduler_name.unwrap_or_default(),
             driver_args: self.driver_args.unwrap_or_default(),
             exec_args: self.exec_args.unwrap_or_default(),
+            workload_type: self.workload_type.unwrap_or_default(),
             prog: self.prog.unwrap_or_default(),
         }
     }
@@ -151,6 +165,8 @@ pub struct PySparkSubmit {
     driver_args: PySparkDriverParams,
     /// The parameters of spark executor
     exec_args: PySparkExecutorParams,
+    /// The workload type
+    workload_type: String,
     /// The program executable(or script) to run
     prog: String,
 }
@@ -200,6 +216,16 @@ impl PySparkSubmit {
                 "spark.kubernetes.executor.label.{}={}",
                 DEFAULT_NODE_SELECTOR_LABEL_KEY,
                 id.to_string()
+            ))
+            .add_conf(&format!(
+                "spark.kubernetes.driver.label.{}={}",
+                DEFAULT_WORKLOAD_TYPE_KEY,
+                self.workload_type.clone(),
+            ))
+            .add_conf(&format!(
+                "spark.kubernetes.executor.label.{}={}",
+                DEFAULT_WORKLOAD_TYPE_KEY,
+                self.workload_type.clone(),
             ));
 
         if !self.scheduler_name.is_empty() {

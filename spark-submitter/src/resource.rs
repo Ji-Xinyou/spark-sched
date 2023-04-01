@@ -1,5 +1,9 @@
 use crate::cluster::ClusterState;
 
+const COMPUTE_WORKLOAD_WEIGHT: f64 = 0.2;
+const STORAGE_WORKLOAD_WEIGHT: f64 = 0.8;
+
+#[derive(Debug, Clone)]
 pub enum WorkloadType {
     /// the workload mainly uses cpu, use bandwidth less
     Compute,
@@ -7,8 +11,15 @@ pub enum WorkloadType {
     Storage,
 }
 
+fn workload_type_to_weight(workload_type: &WorkloadType) -> f64 {
+    match workload_type {
+        WorkloadType::Compute => COMPUTE_WORKLOAD_WEIGHT,
+        WorkloadType::Storage => STORAGE_WORKLOAD_WEIGHT,
+    }
+}
+
 pub trait Planner {
-    fn plan(state: &mut ClusterState, n_workload: &mut u32, ty: WorkloadType) -> ResourcePlan;
+    fn plan(state: &mut ClusterState, workload_types: Vec<WorkloadType>) -> Vec<ResourcePlan>;
 }
 
 /// Fair Planner is a planner that treats all workload the same
@@ -24,42 +35,47 @@ pub trait Planner {
 /// the FairPlanner tends to maximize the parallelism of the pods,
 /// hence it will normally schedule the workload with the most nexec
 pub struct FairPlanner;
-pub struct DefaultPlanner;
-
 pub struct WorkloadAwareFairPlanner;
 
 /// estimately the master node uses 2 cpus and 2GB of memory
 /// when we schedule, we need to take that into account
 impl Planner for FairPlanner {
-    fn plan(state: &mut ClusterState, n_workload: &mut u32, _ty: WorkloadType) -> ResourcePlan {
-        let core = state.total_core / *n_workload;
-        let mem_mb = state.total_mem_mb / *n_workload;
-        *n_workload -= 1;
+    fn plan(state: &mut ClusterState, workload_types: Vec<WorkloadType>) -> Vec<ResourcePlan> {
+        let mut n_workload = workload_types.len() as u32;
+        let mut plans = vec![];
 
-        println!("core: {}, mem_mb: {}", core, mem_mb);
+        while n_workload > 0 {
+            let core = state.total_core / n_workload;
+            let mem_mb = state.total_mem_mb / n_workload;
+            n_workload -= 1;
 
-        let plan = ResourcePlan {
-            driver_cpu: 1,
-            driver_mem_mb: 1024,
-            exec_cpu: 1,
-            exec_mem_mb: (mem_mb - 1024) / (core - 1),
-            nexec: core - 1,
-        };
+            println!("core: {}, mem_mb: {}", core, mem_mb);
 
-        state.total_core -= core;
-        state.total_mem_mb -= mem_mb;
+            let plan = ResourcePlan {
+                driver_cpu: 1,
+                driver_mem_mb: 1024,
+                exec_cpu: 1,
+                exec_mem_mb: (mem_mb - 1024) / (core - 1),
+                nexec: core - 1,
+            };
 
-        plan
+            state.total_core -= core;
+            state.total_mem_mb -= mem_mb;
+
+            plans.push(plan);
+        }
+
+        plans
     }
 }
 
-impl Planner for DefaultPlanner {
-    fn plan(_state: &mut ClusterState, _n_workload: &mut u32, _ty: WorkloadType) -> ResourcePlan {
-        return ResourcePlan::default();
+impl Planner for WorkloadAwareFairPlanner {
+    fn plan(state: &mut ClusterState, workload_types: Vec<WorkloadType>) -> Vec<ResourcePlan> {
+        unimplemented!()
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct ResourcePlan {
     driver_cpu: u32,
     driver_mem_mb: u32,
@@ -90,7 +106,7 @@ impl ResourcePlan {
     }
 
     pub fn exec_cpu(&self) -> String {
-        format!("{}m", self.exec_cpu.to_string())
+        self.exec_cpu.to_string()
     }
 
     pub fn exec_mem_mb(&self) -> String {
