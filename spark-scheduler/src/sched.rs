@@ -248,10 +248,10 @@ impl Scheduler {
     }
 
     async fn eval_and_bind(&self, pod: &Pod) -> Result<String> {
-        let mut node_resource_map = self.node_resource_map.lock().await;
+        let node_resource_map = self.node_resource_map.lock().await;
 
         let pod_resource = pod_resource(pod);
-        let filtered_node_names = self.predicate.judge(&self.client, &node_resource_map, pod_resource).await;
+        let filtered_node_names = self.predicate.judge(&self.client, pod_resource).await;
 
         if filtered_node_names.is_empty() {
             return Err(anyhow!(format!(

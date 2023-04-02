@@ -1,8 +1,11 @@
 use std::{collections::HashMap, error::Error};
 
 use async_trait::async_trait;
-use k8s_openapi::{api::core::v1::{Pod, Node}, apimachinery::pkg::api::resource::Quantity};
-use kube::{Client, Api, api::ListParams};
+use k8s_openapi::{
+    api::core::v1::{Node, Pod},
+    apimachinery::pkg::api::resource::Quantity,
+};
+use kube::{api::ListParams, Api, Client};
 
 use crate::sched::{NodeResource, PodResource, SchedHistory};
 
@@ -12,7 +15,6 @@ pub(crate) trait Predicate: Send + Sync {
     async fn judge(
         &self,
         client: &Client,
-        node_resource_map: &HashMap<String, NodeResource>,
         pod_resource: PodResource,
     ) -> Vec<String>;
 }
@@ -38,25 +40,28 @@ impl Predicate for EnoughResourcePredicate {
     async fn judge(
         &self,
         client: &Client,
-        node_resource_map: &HashMap<String, NodeResource>,
         pod_resource: PodResource,
     ) -> Vec<String> {
         let mut node_names = vec![];
-        for (node_name, resource) in node_resource_map {
-            let (remaining_milicores, remaining_mem_ki) = get_remaining_resources(client.clone(), node_name).await.unwrap();
-            println!(
-                "remaining_milicores: {}, remaining_mem_ki: {}",
-                remaining_milicores, remaining_mem_ki
-            );
+        let nodes: Api<Node> = Api::all(client.clone());
+        let lp = ListParams::default();
+        let node_list = nodes.list(&lp).await.expect("failed to list pods");
 
-            if remaining_milicores >= pod_resource.millicore && remaining_mem_ki >= pod_resource.mem_kb {
+        for node in node_list {
+            let node_name = node.metadata.name.unwrap();
+            let (remaining_milicores, remaining_mem_ki) =
+                get_remaining_resources(client.clone(), &node_name)
+                    .await
+                    .unwrap();
+
+            if remaining_milicores >= pod_resource.millicore
+                && remaining_mem_ki >= pod_resource.mem_kb
+            {
                 node_names.push(node_name.to_string());
             }
         }
-        println!(
-            "\njudging\n  resource: {:#?}\n  filtered: {:#?}\n",
-            node_resource_map, node_names
-        );
+        println!("\njudging\n filtered: {:#?}\n", node_names);
+
         node_names
     }
 }
@@ -151,13 +156,24 @@ impl Priority for NetworkAwarePriority {
     }
 }
 
-async fn get_remaining_resources(client: Client, node_name: &str) -> Result<(u64, u64), Box<dyn Error>> {
-    let (cpu_allocatable_millicores, memory_allocatable_ki) = get_allocatable_resources(client.clone(), node_name).await?;
-    let (cpu_allocated, memory_allocated_ki) = get_allocated_resources(client.clone(), node_name).await?;
-    Ok((cpu_allocatable_millicores.saturating_sub(cpu_allocated), memory_allocatable_ki.saturating_sub(memory_allocated_ki)))
+async fn get_remaining_resources(
+    client: Client,
+    node_name: &str,
+) -> Result<(u64, u64), Box<dyn Error>> {
+    let (cpu_allocatable_millicores, memory_allocatable_ki) =
+        get_allocatable_resources(client.clone(), node_name).await?;
+    let (cpu_allocated, memory_allocated_ki) =
+        get_allocated_resources(client.clone(), node_name).await?;
+    Ok((
+        cpu_allocatable_millicores.saturating_sub(cpu_allocated),
+        memory_allocatable_ki.saturating_sub(memory_allocated_ki),
+    ))
 }
 
-async fn get_allocatable_resources(client: Client, node_name: &str) -> Result<(u64, u64), Box<dyn Error>> {
+async fn get_allocatable_resources(
+    client: Client,
+    node_name: &str,
+) -> Result<(u64, u64), Box<dyn Error>> {
     let node_api: Api<Node> = Api::all(client.clone());
     let node = node_api.get(node_name).await.expect("failed to get node");
     let allocatable = node.status.as_ref().unwrap().allocatable.as_ref().unwrap();
@@ -170,7 +186,10 @@ async fn get_allocatable_resources(client: Client, node_name: &str) -> Result<(u
     Ok((cpu_allocatable_millicores, memory_allocatable_ki))
 }
 
-async fn get_allocated_resources(client: Client, node_name: &str) -> Result<(u64, u64), Box<dyn Error>> {
+async fn get_allocated_resources(
+    client: Client,
+    node_name: &str,
+) -> Result<(u64, u64), Box<dyn Error>> {
     let pods: Api<Pod> = Api::all(client);
     let lp = ListParams::default();
     let pod_list = pods.list(&lp).await?;
@@ -179,7 +198,15 @@ async fn get_allocated_resources(client: Client, node_name: &str) -> Result<(u64
     let mut memory_allocated_kibytes = 0;
 
     for pod in pod_list.into_iter() {
-        if pod.spec.as_ref().unwrap().node_name.as_ref().unwrap_or(&String::new()) == node_name {
+        if pod
+            .spec
+            .as_ref()
+            .unwrap()
+            .node_name
+            .as_ref()
+            .unwrap_or(&String::new())
+            == node_name
+        {
             let containers = &pod.spec.as_ref().unwrap().containers;
             for container in containers {
                 if let Some(resources) = container.resources.as_ref() {
