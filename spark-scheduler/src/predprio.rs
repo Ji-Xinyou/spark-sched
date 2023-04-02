@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, error::Error};
 
 use async_trait::async_trait;
-use k8s_openapi::api::core::v1::Pod;
-use rand::Rng;
+use k8s_openapi::{api::core::v1::{Pod, Node}, apimachinery::pkg::api::resource::Quantity};
+use kube::{Client, Api, api::ListParams};
 
 use crate::sched::{NodeResource, PodResource, SchedHistory};
 
@@ -11,6 +11,7 @@ use crate::sched::{NodeResource, PodResource, SchedHistory};
 pub(crate) trait Predicate: Send + Sync {
     async fn judge(
         &self,
+        client: &Client,
         node_resource_map: &HashMap<String, NodeResource>,
         pod_resource: PodResource,
     ) -> Vec<String>;
@@ -24,7 +25,6 @@ pub(crate) trait Priority: Send + Sync {
         pod: &Pod,
         bw_map: &HashMap<(String, String), u32>,
         choice: &mut HashMap<String, u32>,
-        prev_sched: &SchedHistory,
     ) -> HashMap<String, u32>;
 }
 
@@ -37,18 +37,19 @@ pub(crate) struct EnoughResourcePredicate;
 impl Predicate for EnoughResourcePredicate {
     async fn judge(
         &self,
+        client: &Client,
         node_resource_map: &HashMap<String, NodeResource>,
         pod_resource: PodResource,
     ) -> Vec<String> {
         let mut node_names = vec![];
         for (node_name, resource) in node_resource_map {
-            let cpu = resource.cpu;
-            let mem_kb = resource.mem_kb;
+            let (remaining_milicores, remaining_mem_ki) = get_remaining_resources(client.clone(), node_name).await.unwrap();
+            println!(
+                "remaining_milicores: {}, remaining_mem_ki: {}",
+                remaining_milicores, remaining_mem_ki
+            );
 
-            let pod_cpu = pod_resource.cpu;
-            let pod_mem_kb = pod_resource.mem_kb;
-
-            if cpu >= pod_cpu && mem_kb >= pod_mem_kb {
+            if remaining_milicores >= pod_resource.millicore && remaining_mem_ki >= pod_resource.mem_kb {
                 node_names.push(node_name.to_string());
             }
         }
@@ -61,73 +62,7 @@ impl Predicate for EnoughResourcePredicate {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct RandomPriority;
-
-/// Gang Priority is a priority function that prioritizes nodes based on the
-/// sched history of the pods. For those with the same uuid, we give me highest
-/// priority to the node that has the most pods with the same uuid.
-///
-/// todo: consider network
-#[derive(Debug, Default)]
-pub(crate) struct GangPriority;
-
-/// Based on GangPriority, this also takes network speed into account, it will give the
-/// highest priority to the pod that has the fastest network bandwidth with the storage node.
-/// It also consider the network speed between candidate node and the nodes having its peer.
-#[derive(Debug, Default)]
 pub(crate) struct NetworkAwarePriority;
-
-// impl Priority for RandomPriority {
-//     fn priority(
-//         &self,
-//         node_name: &str,
-//         node_resource_map: &HashMap<String, NodeResource>,
-//         pod: &Pod,
-//         bw_map: &HashMap<(String, String), u32>,
-//         choice: &HashMap<String, u32>,
-//         prev_sched: &SchedHistory,
-//     ) -> u32 {
-//         let mut rng = rand::thread_rng();
-//         let random_int = rng.gen_range(0..=100);
-//         random_int
-//     }
-// }
-
-// impl Priority for GangPriority {
-//     fn priority(
-//         &self,
-//         node_name: &str,
-//         node_resource_map: &HashMap<String, NodeResource>,
-//         pod: &Pod,
-//         bw_map: &HashMap<(String, String), u32>,
-//         choice: &HashMap<String, u32>,
-//         prev_sched: &SchedHistory,
-//     ) -> u32 {
-//         let uuid = pod
-//             .clone()
-//             .metadata
-//             .labels
-//             .unwrap()
-//             .get("spark-uuid")
-//             .unwrap()
-//             .clone();
-
-//         // Some pods of this uuid has already been sched, check if the node_name is in it
-//         let is_peer_sched = prev_sched.get(&uuid);
-//         if is_peer_sched.is_some() {
-//             let peer_sched = is_peer_sched.unwrap();
-//             for alloc in peer_sched {
-//                 if alloc.node_name == node_name {
-//                     return 100;
-//                 }
-//             }
-//         }
-
-//         // either no pod of this uuid has been sched, or this node_name has no pod of this uuid
-//         // return the one with the most cpu
-//         node_resource_map.get(node_name).unwrap().cpu * 10
-//     }
-// }
 
 impl Priority for NetworkAwarePriority {
     fn priority(
@@ -137,7 +72,6 @@ impl Priority for NetworkAwarePriority {
         pod: &Pod,
         bw_map: &HashMap<(String, String), u32>,
         choice: &mut HashMap<String, u32>,
-        prev_sched: &SchedHistory,
     ) -> HashMap<String, u32> {
         let mut m = HashMap::new();
         for node in node_name {
@@ -214,5 +148,80 @@ impl Priority for NetworkAwarePriority {
         };
 
         m
+    }
+}
+
+async fn get_remaining_resources(client: Client, node_name: &str) -> Result<(u64, u64), Box<dyn Error>> {
+    let (cpu_allocatable_millicores, memory_allocatable_ki) = get_allocatable_resources(client.clone(), node_name).await?;
+    let (cpu_allocated, memory_allocated_ki) = get_allocated_resources(client.clone(), node_name).await?;
+    Ok((cpu_allocatable_millicores.saturating_sub(cpu_allocated), memory_allocatable_ki.saturating_sub(memory_allocated_ki)))
+}
+
+async fn get_allocatable_resources(client: Client, node_name: &str) -> Result<(u64, u64), Box<dyn Error>> {
+    let node_api: Api<Node> = Api::all(client.clone());
+    let node = node_api.get(node_name).await.expect("failed to get node");
+    let allocatable = node.status.as_ref().unwrap().allocatable.as_ref().unwrap();
+    let cpu_allocatable = allocatable["cpu"].clone();
+    let memory_allocatable = allocatable["memory"].clone();
+
+    let cpu_allocatable_millicores = quantity_to_millicores(cpu_allocatable).unwrap();
+    let memory_allocatable_ki = quantity_to_kibytes(memory_allocatable).unwrap();
+
+    Ok((cpu_allocatable_millicores, memory_allocatable_ki))
+}
+
+async fn get_allocated_resources(client: Client, node_name: &str) -> Result<(u64, u64), Box<dyn Error>> {
+    let pods: Api<Pod> = Api::all(client);
+    let lp = ListParams::default();
+    let pod_list = pods.list(&lp).await?;
+
+    let mut cpu_allocated_millicores = 0;
+    let mut memory_allocated_kibytes = 0;
+
+    for pod in pod_list.into_iter() {
+        if pod.spec.as_ref().unwrap().node_name.as_ref().unwrap_or(&String::new()) == node_name {
+            let containers = &pod.spec.as_ref().unwrap().containers;
+            for container in containers {
+                if let Some(resources) = container.resources.as_ref() {
+                    if let Some(requests) = resources.requests.as_ref() {
+                        if let Some(cpu) = requests.get("cpu") {
+                            cpu_allocated_millicores += quantity_to_millicores(cpu.clone())?;
+                        }
+                        if let Some(memory) = requests.get("memory") {
+                            memory_allocated_kibytes += quantity_to_kibytes(memory.clone())?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((cpu_allocated_millicores, memory_allocated_kibytes))
+}
+
+pub fn quantity_to_millicores(q: Quantity) -> Result<u64, Box<dyn Error>> {
+    let s = q.0.to_string();
+    if s.ends_with("m") {
+        let val = s.trim_end_matches('m').parse::<u64>()?;
+        Ok(val)
+    } else {
+        let val = s.parse::<u64>()?;
+        Ok(val * 1000)
+    }
+}
+
+pub fn quantity_to_kibytes(q: Quantity) -> Result<u64, Box<dyn Error>> {
+    let s = q.0.to_string();
+    if s.ends_with("Ki") {
+        let val = s.trim_end_matches("Ki").parse::<u64>()?;
+        Ok(val)
+    } else if s.ends_with("Mi") {
+        let val = s.trim_end_matches("Mi").parse::<u64>()?;
+        Ok(val * 1024)
+    } else if s.ends_with("Gi") {
+        let val = s.trim_end_matches("Gi").parse::<u64>()?;
+        Ok(val * 1024 * 1024)
+    } else {
+        Err("Unsupported memory unit".into())
     }
 }

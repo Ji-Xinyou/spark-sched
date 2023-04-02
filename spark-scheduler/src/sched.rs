@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::ops::{EmitParameters, PodBindParameters};
-use crate::predprio::{EnoughResourcePredicate, Predicate, Priority};
+use crate::predprio::{EnoughResourcePredicate, Predicate, Priority, quantity_to_millicores, quantity_to_kibytes};
 
 const SCHEDULER_NAME: &str = "spark-sched";
 const SPARK_NAMESPACE: &str = "spark";
@@ -52,7 +52,6 @@ pub(crate) struct Scheduler {
     pub(crate) next_choice: RwLock<HashMap<String, u32>>,
 
     pub(crate) node_resource_map: Mutex<HashMap<String, NodeResource>>,
-    pub(crate) prev_sched: RwLock<SchedHistory>,
 }
 
 impl Scheduler {
@@ -66,7 +65,6 @@ impl Scheduler {
             priority: Arc::new(crate::predprio::NetworkAwarePriority::default()),
             bandwidth_map: hard_coded_network_bandwidth_map(),
             next_choice: RwLock::new(HashMap::new()),
-            prev_sched: RwLock::new(HashMap::new()),
             node_resource_map,
         };
 
@@ -88,18 +86,17 @@ impl Scheduler {
             println!("\nWaiting to schedule pod...");
             let pod = rx.recv().await.expect("the pod queue is closed");
             let sched = sched.clone();
-            let ok = sched.sched_pod(&pod).await;
-            println!("pod scheduled success??: {}\n", ok);
 
-            // let tx_c = tx_c.clone();
-            // tokio::spawn(async move {
-            //     let ok = sched.sched_pod(&pod).await;
-            //     // if failed to schedule, put it back to the rx
-            //     // if !ok {
-            //     //     let tx = tx_c.clone();
-            //     //     tx.send(pod).unwrap();
-            //     // }
-            // });
+            let tx_c = tx_c.clone();
+            tokio::spawn(async move {
+                let ok = sched.sched_pod(&pod).await;
+                println!("pod scheduled success??: {}\n", ok);
+                // if failed to schedule, put it back to the rx
+                if !ok {
+                    let tx = tx_c.clone();
+                    tx.send(pod).unwrap();
+                }
+            });
         }
     }
 
@@ -170,8 +167,6 @@ impl Scheduler {
             .unwrap()
             .clone();
 
-        self.update_sched_hist(uuid, node_name).await;
-
         // emit the event the the pod has been binded
         let emit_params = EmitParameters {
             pod: pod.clone(),
@@ -192,37 +187,11 @@ impl Scheduler {
 
 // utilities
 impl Scheduler {
-    async fn update_sched_hist(&self, uuid: String, node_name: String) {
-        let mut hist = self.prev_sched.write().await;
-        let alloc = hist.get_mut(&uuid);
-        match alloc {
-            // a seen spark job, update the alloc
-            Some(alloc_hist) => {
-                for alloc in alloc_hist.iter_mut() {
-                    if alloc.node_name == node_name {
-                        alloc.nr += 1;
-                        println!("updated sched hist: {:?}", hist);
-                        return;
-                    }
-                }
-                // not returned, so it is a new node
-                alloc_hist.push(Alloc { node_name, nr: 1 });
-            }
-            // an unseen spark job
-            None => {
-                hist.insert(uuid, vec![Alloc { node_name, nr: 1 }]);
-            }
-        };
-
-        println!("updated sched hist: {:?}", hist);
-    }
-
     async fn renew_resource_map_if_no_pod(&self) {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
         let pods = pods.list(&ListParams::default()).await.unwrap().items;
         if pods.is_empty() {
             self.renew_resource_map().await;
-            self.prev_sched.write().await.clear();
             self.next_choice.write().await.clear();
             println!("Node resource map renewed!");
         }
@@ -282,7 +251,7 @@ impl Scheduler {
         let mut node_resource_map = self.node_resource_map.lock().await;
 
         let pod_resource = pod_resource(pod);
-        let filtered_node_names = self.predicate.judge(&node_resource_map, pod_resource).await;
+        let filtered_node_names = self.predicate.judge(&self.client, &node_resource_map, pod_resource).await;
 
         if filtered_node_names.is_empty() {
             return Err(anyhow!(format!(
@@ -292,14 +261,12 @@ impl Scheduler {
             )));
         }
 
-        let prev_sched = self.prev_sched.read().await;
         let mut choice = self.next_choice.write().await;
         let priorities = self.prioritize(
             &filtered_node_names,
             &node_resource_map,
             pod,
             &mut choice,
-            &prev_sched,
         );
         let best_node = self.find_best_node(&priorities);
 
@@ -321,8 +288,8 @@ impl Scheduler {
         match bind_result {
             Ok(_) => {
                 // update node resource map
-                node_resource_map.get_mut(&best_node).unwrap().cpu -= pod_resource.cpu;
-                node_resource_map.get_mut(&best_node).unwrap().mem_kb -= pod_resource.mem_kb;
+                // node_resource_map.get_mut(&best_node).unwrap().cpu -= pod_resource.cpu;
+                // node_resource_map.get_mut(&best_node).unwrap().mem_kb -= pod_resource.mem_kb;
             }
             Err(e) => {
                 println!(
@@ -341,7 +308,6 @@ impl Scheduler {
         node_resource_map: &HashMap<String, NodeResource>,
         pod: &Pod,
         choice: &mut HashMap<String, u32>,
-        prev_sched: &SchedHistory,
     ) -> HashMap<String, u32> {
         self.priority.priority(
             node_names,
@@ -349,7 +315,6 @@ impl Scheduler {
             pod,
             &self.bandwidth_map.clone(),
             choice,
-            prev_sched,
         )
     }
 
@@ -368,8 +333,8 @@ impl Scheduler {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct PodResource {
-    pub(crate) cpu: u32,
-    pub(crate) mem_kb: u32,
+    pub(crate) millicore: u64,
+    pub(crate) mem_kb: u64,
 }
 
 pub(crate) fn pod_resource(pod: &Pod) -> PodResource {
@@ -387,17 +352,15 @@ pub(crate) fn pod_resource(pod: &Pod) -> PodResource {
         .as_ref()
         .unwrap();
 
-    let cpu = pod_req.get("cpu").unwrap().0.parse::<u32>().unwrap();
+    let cpu = pod_req.get("cpu").unwrap();
     let mem_kb = pod_req
         .get("memory")
-        .unwrap()
-        .0
-        .chars()
-        .filter(|c| c.is_numeric())
-        .collect::<String>()
-        .parse::<u32>()
         .unwrap();
-    PodResource { cpu, mem_kb }
+
+    let millicore= quantity_to_millicores(cpu.clone()).unwrap();
+    let mem_kb = quantity_to_kibytes(mem_kb.clone()).unwrap();
+
+    PodResource { millicore, mem_kb }
 }
 
 pub(crate) fn hard_coded_network_bandwidth_map() -> HashMap<(String, String), u32> {
