@@ -85,20 +85,21 @@ impl Scheduler {
         sched.clone().start_pod_watcher(tx);
 
         loop {
-            println!("Waiting to schedule pod...");
+            println!("\nWaiting to schedule pod...");
             let pod = rx.recv().await.expect("the pod queue is closed");
             let sched = sched.clone();
+            let ok = sched.sched_pod(&pod).await;
+            println!("pod scheduled success??: {}\n", ok);
 
-            let tx_c = tx_c.clone();
-            tokio::spawn(async move {
-                let ok = sched.sched_pod(&pod).await;
-                // if failed to schedule, put it back to the rx
-                // if !ok {
-                //     let tx = tx_c.clone();
-                //     tx.send(pod).unwrap();
-                // }
-                println!("pod scheduled success??: {}", ok);
-            });
+            // let tx_c = tx_c.clone();
+            // tokio::spawn(async move {
+            //     let ok = sched.sched_pod(&pod).await;
+            //     // if failed to schedule, put it back to the rx
+            //     // if !ok {
+            //     //     let tx = tx_c.clone();
+            //     //     tx.send(pod).unwrap();
+            //     // }
+            // });
         }
     }
 

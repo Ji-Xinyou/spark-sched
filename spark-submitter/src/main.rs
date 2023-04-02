@@ -88,15 +88,14 @@ struct Args {
 async fn main() {
     let args = Args::parse();
     let mut cmds = vec![];
-    let mut state = get_cluster_state().await.unwrap();
+
     let n_workload = args.progs.len() as u32;
+    let mut state = get_cluster_state().await.unwrap();
 
     // has to be the same
     assert_eq!(n_workload, args.tags.len() as u32);
 
     println!("\nRunning {} workloads", n_workload);
-    println!("Cluster state: {:#?}", state);
-
     println!("Using {} planner", args.planner);
     let plannerfunc = match args.planner.as_str() {
         "fair" => FairPlanner::plan,
@@ -118,9 +117,8 @@ async fn main() {
         workload_types
     };
 
-    let plans = plannerfunc(&mut state, workload_types);
+    let plans = plannerfunc(&mut state, &workload_types);
 
-    let parallelism = parallelism_func(state.total_core);
     for (i, prog) in args.progs.iter().enumerate() {
         let plan = plans[i];
         println!("For the {}-th workload, emitting plan: {:#?}", i, &plan);
@@ -152,6 +150,7 @@ async fn main() {
             },
         };
 
+        let parallelism = parallelism_func(driver_cpu, exec_cpu, nexec);
         let mut cmd = PysparkSubmitBuilder::new()
             .path(args.path.clone())
             .master(args.master.clone())
@@ -163,6 +162,7 @@ async fn main() {
             .scheduler(args.scheduler_name.clone())
             .driver_args(driver_args)
             .exec_args(exec_args)
+            .workload_type(workload_types[i].to_string())
             .prog(prog.clone())
             .build()
             .into_command();
@@ -172,6 +172,7 @@ async fn main() {
             cmd.cmd.stderr(std::process::Stdio::null());
         }
 
+        println!("cmd: {:?}", cmd.cmd.get_args());
         cmds.push(cmd)
     }
 
@@ -183,7 +184,6 @@ async fn main() {
     let mut childs = vec![];
     for mut cmd in cmds {
         println!("Spawning one workload");
-        println!("cmd: {:?}", cmd.cmd.get_args());
         childs.push(cmd.cmd.spawn().unwrap());
     }
 
@@ -212,6 +212,10 @@ where
     println!("One workload exits, elapsed time: {} ms", e);
 }
 
-fn parallelism_func(total_core: u32) -> u32 {
+fn parallelism_func(driver_cpu: String, exec_cpu: String, nexec: String) -> u32 {
+    let dcore = driver_cpu.parse::<u32>().unwrap();
+    let ecore = exec_cpu.parse::<u32>().unwrap();
+    let nexec = nexec.parse::<u32>().unwrap();
+    let total_core = dcore + ecore * nexec;
     5 * total_core
 }
