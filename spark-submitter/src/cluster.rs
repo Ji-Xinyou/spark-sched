@@ -21,7 +21,7 @@ fn reserved_core(nr_node: u32) -> u32 {
     if nr_node == 1 {
         3
     } else {
-        3 + (nr_node - 2)
+        4 + (nr_node - 2)
     }
 }
 

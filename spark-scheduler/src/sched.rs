@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crate::ops::{EmitParameters, PodBindParameters};
 use crate::predprio::{
-    quantity_to_kibytes, quantity_to_millicores, EnoughResourcePredicate, Predicate, Priority,
+    quantity_to_kibytes, quantity_to_millicores, EnoughResourcePredicate, Predicate, Priority, get_pod_uuid,
 };
 
 const SCHEDULER_NAME: &str = "spark-sched";
@@ -30,23 +30,20 @@ pub(crate) struct Scheduler {
 
     pub(crate) bandwidth_map: HashMap<(String, String), u32>,
     pub(crate) next_choice: RwLock<HashMap<String, u32>>,
+    pub(crate) sched_hist: RwLock<HashMap<String, Vec<String>>>,
 }
 
 impl Scheduler {
-    pub async fn new(client: Client, args: crate::Args) -> Self {
-        let prio: Arc<dyn Priority> = match args.prio.as_str() {
-            "network" => Arc::new(crate::predprio::NetworkAwarePriority::default()),
-            "workload" => Arc::new(crate::predprio::WorkloadNetworkAwarePriority::default()),
-            _ => panic!("unknown priority"),
-        };
+    pub async fn new(client: Client) -> Self {
 
         let sched = Scheduler {
             client,
             namespace: SPARK_NAMESPACE.to_string(),
             predicate: Arc::new(EnoughResourcePredicate::default()),
-            priority: prio,
+            priority: Arc::new(crate::predprio::WorkloadNetworkAwarePriority::default()),
             bandwidth_map: hard_coded_network_bandwidth_map(),
             next_choice: RwLock::new(HashMap::new()),
+            sched_hist: RwLock::new(HashMap::new()),
         };
 
         sched
@@ -68,6 +65,9 @@ impl Scheduler {
 
             let ok = sched.sched_pod(&pod).await;
             println!("pod scheduled success??: {}\n", ok);
+
+            let sched_hist = sched.sched_hist.read().await;
+            println!("sched hist: {:#?}", sched_hist);
 
             if !ok {
                 tx_c.send(pod).unwrap();
@@ -126,6 +126,14 @@ impl Scheduler {
             return false;
         }
         let node_name = node_name.unwrap();
+
+        let uuid = get_pod_uuid(pod);
+        self.sched_hist
+            .write()
+            .await
+            .entry(uuid)
+            .or_insert_with(Vec::new)
+            .push(node_name.clone());
 
         let message = format!(
             "Placed pod [{}/{}] on {}\n",
@@ -224,7 +232,6 @@ impl Scheduler {
                 self.client.clone(),
                 node_names,
                 pod,
-                &self.bandwidth_map.clone(),
                 choice,
             )
             .await

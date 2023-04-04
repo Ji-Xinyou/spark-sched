@@ -26,7 +26,6 @@ pub(crate) trait Priority: Send + Sync {
         client: Client,
         node_name: &[String],
         pod: &Pod,
-        bw_map: &HashMap<(String, String), u32>,
         choice: &mut HashMap<String, u32>,
     ) -> HashMap<String, u32>;
 }
@@ -70,98 +69,7 @@ impl Predicate for EnoughResourcePredicate {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct NetworkAwarePriority;
-
-#[derive(Debug, Default)]
 pub(crate) struct WorkloadNetworkAwarePriority;
-
-#[async_trait]
-impl Priority for NetworkAwarePriority {
-    async fn priority(
-        &self,
-        client: Client,
-        node_name: &[String],
-        pod: &Pod,
-        bw_map: &HashMap<(String, String), u32>,
-        choice: &mut HashMap<String, u32>,
-    ) -> HashMap<String, u32> {
-        let mut m = HashMap::new();
-        for node in node_name {
-            m.insert(node.to_string(), 0);
-        }
-
-        let nodes: Api<Node> = Api::all(client.clone());
-        let lp = ListParams::default();
-        let node_list = nodes.list(&lp).await.expect("failed to list pods");
-        let nr_node = node_list.items.len();
-
-        let uuid = get_pod_uuid(pod);
-
-        let this_choice = choice.get(&uuid);
-        let mut c = match this_choice {
-            Some(c) => *c,
-            None => 0,
-        };
-
-        // candidate bws
-        let mut bws = vec![];
-        for node in node_name {
-            let bw_to_storage = bw_map.get(&(node.to_string(), "xyji".to_string())).unwrap();
-            bws.push((node.to_string(), *bw_to_storage));
-        }
-
-        // find the lowest bw >= choice
-        let mut all_bws = vec![];
-        for node in node_list {
-            let name = node.metadata.name.unwrap();
-            let bw_to_storage = bw_map.get(&(name.clone(), "xyji".to_string())).unwrap();
-            all_bws.push((name, *bw_to_storage));
-        }
-        all_bws.sort_by(|a, b| a.1.cmp(&b.1));
-
-        let mut node_with_index = vec![];
-        for bw in bws {
-            // find the bw's index in all_bws
-            let mut index = 0;
-            for (i, all_bw) in all_bws.iter().enumerate() {
-                if bw.0 == all_bw.0 {
-                    index = i;
-                    break;
-                }
-            }
-            node_with_index.push((bw.0, index));
-        }
-        node_with_index.sort_by(|a, b| a.1.cmp(&b.1));
-
-        // make decision based on sorted nodes, ascending
-        let mut flag = false;
-        for (i, node) in node_with_index.iter().enumerate() {
-            if i >= c as usize {
-                flag = true;
-                m.insert(node.0.to_string(), 100);
-                c = ((i + 1) % nr_node) as u32;
-                break;
-            }
-        }
-        // if not found chose the largest one
-        if !flag {
-            let node = node_with_index.last().unwrap();
-            m.insert(node.0.to_string(), 100);
-            c = ((node.1 + 1) % nr_node) as u32;
-        }
-
-        // update the choice
-        let _choice = choice.get_mut(&uuid);
-        match _choice {
-            Some(ch) => *ch = c,
-            None => {
-                choice.insert(uuid, c);
-            }
-        };
-
-        m
-    }
-}
 
 #[async_trait]
 impl Priority for WorkloadNetworkAwarePriority {
@@ -170,7 +78,6 @@ impl Priority for WorkloadNetworkAwarePriority {
         client: Client,
         node_name: &[String],
         pod: &Pod,
-        bw_map: &HashMap<(String, String), u32>,
         choice: &mut HashMap<String, u32>,
     ) -> HashMap<String, u32> {
         let mut m = HashMap::new();
@@ -186,68 +93,53 @@ impl Priority for WorkloadNetworkAwarePriority {
         let uuid = get_pod_uuid(pod);
         let workload_type = get_pod_workload_type(pod);
 
+        let bw_order = vec!["xyji", "node03", "node02", "node1"];
+        if workload_type == DEFAULT_COMPUTE_WORKLOAD {
+            let mut index = 0;
+            for node in node_name {
+                let i = bw_order.iter().position(|&r| r == node).unwrap();
+                if i > index {
+                    index = i
+                }
+            }
+            println!("Placeing compute nodes on node: {}", bw_order[index]);
+            m.insert(bw_order[index].to_string(), 100);
+            return m;
+        }
+
         let this_choice = choice.get(&uuid);
         let mut c = match this_choice {
             Some(c) => *c,
             None => 0,
         };
 
-        // candidate bws
-        let mut bws = vec![];
+        // find the first one index >= c and in node_name
+        let mut min_index = 4;
         for node in node_name {
-            let bw_to_storage = bw_map.get(&(node.to_string(), "xyji".to_string())).unwrap();
-            bws.push((node.to_string(), *bw_to_storage));
-        }
-
-        // find the lowest bw >= choice
-        let mut all_bws = vec![];
-        for node in node_list {
-            let name = node.metadata.name.unwrap();
-            let bw_to_storage = bw_map.get(&(name.clone(), "xyji".to_string())).unwrap();
-            all_bws.push((name, *bw_to_storage));
-        }
-        all_bws.sort_by(|a, b| a.1.cmp(&b.1));
-
-        if workload_type == DEFAULT_COMPUTE_WORKLOAD {
-            for bw in &all_bws {
-                if node_name.contains(&bw.0) {
-                    println!("a compute workload, pod: {:?} bounded to node: {}", pod.metadata.name, bw.0);
-                    m.insert(bw.0.clone(), 100);
-                    return m;
+            let index = bw_order.iter().position(|&r| r == node).unwrap();
+            if index >= c as usize {
+                if index < min_index {
+                    min_index = index;
                 }
             }
         }
 
-        let mut node_with_index = vec![];
-        for bw in bws {
-            // find the bw's index in all_bws
-            let mut index = 0;
-            for (i, all_bw) in all_bws.iter().enumerate() {
-                if bw.0 == all_bw.0 {
-                    index = i;
-                    break;
+        if min_index == 4 {
+            // not found, choose the one with the largest index
+            let mut max_index = 0;
+            for node in node_name {
+                let index = bw_order.iter().position(|&r| r == node).unwrap();
+                if index >= max_index {
+                    max_index = index;
                 }
             }
-            node_with_index.push((bw.0, index));
+            min_index = max_index;
         }
-        node_with_index.sort_by(|a, b| a.1.cmp(&b.1));
 
-        // make decision based on sorted nodes, ascending
-        let mut flag = false;
-        for (i, node) in node_with_index.iter().enumerate() {
-            if i >= c as usize {
-                flag = true;
-                m.insert(node.0.to_string(), 100);
-                c = ((i + 1) % nr_node) as u32;
-                break;
-            }
-        }
-        // if not found chose the largest one
-        if !flag {
-            let node = node_with_index.last().unwrap();
-            m.insert(node.0.to_string(), 100);
-            c = ((node.1 + 1) % nr_node) as u32;
-        }
+        let chosen_node = bw_order[min_index];
+        c = ((min_index + 1) % nr_node) as u32;
+
+        m.insert(chosen_node.to_string(), 100);
 
         // update the choice
         let _choice = choice.get_mut(&uuid);
@@ -274,7 +166,7 @@ fn get_pod_workload_type(pod: &Pod) -> String {
         .clone()
 }
 
-fn get_pod_uuid(pod: &Pod) -> String {
+pub fn get_pod_uuid(pod: &Pod) -> String {
     pod
         .clone()
         .metadata

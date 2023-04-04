@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use crate::cluster::ClusterState;
 
-const COMPUTE_WORKLOAD_WEIGHT: f64 = 0.3;
-const STORAGE_WORKLOAD_WEIGHT: f64 = 0.7;
+const COMPUTE_WORKLOAD_WEIGHT: f64 = 0.4;
+const STORAGE_WORKLOAD_WEIGHT: f64 = 0.6;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WorkloadType {
@@ -19,13 +19,6 @@ impl WorkloadType {
             WorkloadType::Compute => "compute".to_string(),
             WorkloadType::Storage => "storage".to_string(),
         }
-    }
-}
-
-fn workload_type_to_weight(workload_type: &WorkloadType) -> f64 {
-    match workload_type {
-        WorkloadType::Compute => COMPUTE_WORKLOAD_WEIGHT,
-        WorkloadType::Storage => STORAGE_WORKLOAD_WEIGHT,
     }
 }
 

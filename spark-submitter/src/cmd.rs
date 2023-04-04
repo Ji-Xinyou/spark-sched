@@ -220,7 +220,7 @@ impl PySparkSubmit {
             .add_conf(&format!(
                 "spark.kubernetes.driver.label.{}={}",
                 DEFAULT_WORKLOAD_TYPE_KEY,
-                self.workload_type.clone(),
+                "compute".to_string(),
             ))
             .add_conf(&format!(
                 "spark.kubernetes.executor.label.{}={}",
