@@ -172,7 +172,6 @@ async fn main() {
             cmd.cmd.stderr(std::process::Stdio::null());
         }
 
-        println!("cmd: {:?}", cmd.cmd.get_args());
         cmds.push(cmd)
     }
 
@@ -182,9 +181,18 @@ async fn main() {
     }
 
     let mut childs = vec![];
-    for mut cmd in cmds {
-        println!("Spawning one workload");
-        childs.push(cmd.cmd.spawn().unwrap());
+    for (i, cmd) in cmds.iter_mut().enumerate() {
+        if workload_types[i] == resource::WorkloadType::Compute {
+            println!("Spawning one compute workload");
+            childs.push(cmd.cmd.spawn().unwrap());
+        }
+    }
+
+    for (i, cmd) in cmds.iter_mut().enumerate() {
+        if workload_types[i] == resource::WorkloadType::Storage {
+            println!("Spawning one storage workload");
+            childs.push(cmd.cmd.spawn().unwrap());
+        }
     }
 
     let mut wg = WaitGroup::new();

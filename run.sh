@@ -5,14 +5,15 @@
 	--planner workload \
 	--scheduler-name spark-sched \
 	--pvc-claim-name nfs-pvc-spark \
+	--tags storage \
+	--progs "local:///opt/spark/examples/src/main/python/wordcount.py /mnt/input.txt" \
+	--tags storage \
+	--progs "local:///opt/spark/examples/src/main/python/wordcount.py /mnt/input.txt" \
+	--tags storage \
+	--progs "local:///opt/spark/examples/src/main/python/wordcount.py /mnt/input.txt" \
 	--tags compute \
-	--progs "local:///opt/spark/examples/src/main/python/pi.py 1000" \
-
-	# --tags storage \
-	# --progs "local:///opt/spark/examples/src/main/python/wordcount.py /mnt/input.txt" \
-	# --tags storage \
-	# --progs "local:///opt/spark/examples/src/main/python/wordcount.py /mnt/input.txt" \
-	# --tags compute \
-	# --progs "local:///opt/spark/examples/src/main/python/pi.py 1000" \
-	# --tags compute \
-	# --progs "local:///opt/spark/examples/src/main/python/pi.py 1000" \
+	--progs "local:///opt/spark/examples/src/main/python/pi.py 300" \
+	--tags compute \
+	--progs "local:///opt/spark/examples/src/main/python/pi.py 300" \
+	--tags compute \
+	--progs "local:///opt/spark/examples/src/main/python/pi.py 300" \

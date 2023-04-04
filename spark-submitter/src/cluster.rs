@@ -21,7 +21,7 @@ fn reserved_core(nr_node: u32) -> u32 {
     if nr_node == 1 {
         3
     } else {
-        5 + (nr_node - 2)
+        3 + (nr_node - 2)
     }
 }
 
@@ -29,6 +29,7 @@ fn reserved_mem(nr_node: u32) -> u32 {
     5 * 1024 * nr_node
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct NodeState {
     /// the cpu core

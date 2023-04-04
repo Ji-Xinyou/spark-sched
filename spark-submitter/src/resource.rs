@@ -66,7 +66,7 @@ impl Planner for FairPlanner {
                 driver_cpu: 1,
                 driver_mem_mb: 1024,
                 exec_cpu: 1,
-                exec_mem_mb: (mem_mb - 1024) / (core - 1),
+                exec_mem_mb: 1024,
                 nexec: core - 1,
             };
 
@@ -118,7 +118,7 @@ impl Planner for WorkloadAwareFairPlanner {
                         driver_cpu: 1,
                         driver_mem_mb: 1024,
                         exec_cpu: 1,
-                        exec_mem_mb: (c_mem - 1024) / (c_core - 1),
+                        exec_mem_mb: 1024,
                         nexec: c_core - 1,
                     };
                     state.total_core -= c_core;
@@ -149,7 +149,7 @@ impl Planner for WorkloadAwareFairPlanner {
                         driver_cpu: 1,
                         driver_mem_mb: 1024,
                         exec_cpu: 1,
-                        exec_mem_mb: (mem - 1024) / (core - 1),
+                        exec_mem_mb: 1024,
                         nexec: core - 1,
                     };
                     state.total_core -= core;

@@ -7,23 +7,24 @@ use k8s_openapi::{
 };
 use kube::{api::ListParams, Api, Client};
 
-use crate::sched::{NodeResource, PodResource, SchedHistory};
+use crate::sched::PodResource;
+
+const DEFAULT_UUID_KEY: &str = "spark-uuid";
+const DEFAULT_WORKLOAD_TYPE_KEY: &str = "spark-workload-type";
+const DEFAULT_COMPUTE_WORKLOAD: &str = "compute";
 
 /// Gives filtered node_names
 #[async_trait]
 pub(crate) trait Predicate: Send + Sync {
-    async fn judge(
-        &self,
-        client: &Client,
-        pod_resource: PodResource,
-    ) -> Vec<String>;
+    async fn judge(&self, client: &Client, pod_resource: PodResource) -> Vec<String>;
 }
 
+#[async_trait]
 pub(crate) trait Priority: Send + Sync {
-    fn priority(
+    async fn priority(
         &self,
+        client: Client,
         node_name: &[String],
-        node_resource_map: &HashMap<String, NodeResource>,
         pod: &Pod,
         bw_map: &HashMap<(String, String), u32>,
         choice: &mut HashMap<String, u32>,
@@ -37,16 +38,13 @@ pub(crate) struct EnoughResourcePredicate;
 
 #[async_trait]
 impl Predicate for EnoughResourcePredicate {
-    async fn judge(
-        &self,
-        client: &Client,
-        pod_resource: PodResource,
-    ) -> Vec<String> {
+    async fn judge(&self, client: &Client, pod_resource: PodResource) -> Vec<String> {
         let mut node_names = vec![];
         let nodes: Api<Node> = Api::all(client.clone());
         let lp = ListParams::default();
         let node_list = nodes.list(&lp).await.expect("failed to list pods");
 
+        println!("|pod {}| request milicores: {}, mem_kib: {}", pod_resource.name, pod_resource.millicore, pod_resource.mem_kb);
         for node in node_list {
             let node_name = node.metadata.name.unwrap();
             let (remaining_milicores, remaining_mem_ki) =
@@ -54,13 +52,18 @@ impl Predicate for EnoughResourcePredicate {
                     .await
                     .unwrap();
 
+            println!(
+                "|node {}| remaining milicores: {}, mem_kib: {}",
+                &node_name, remaining_milicores, remaining_mem_ki
+            );
+
             if remaining_milicores >= pod_resource.millicore
                 && remaining_mem_ki >= pod_resource.mem_kb
             {
                 node_names.push(node_name.to_string());
             }
         }
-        println!("\njudging\n filtered: {:#?}\n", node_names);
+        println!("filtered: {:#?}\n", node_names);
 
         node_names
     }
@@ -69,11 +72,15 @@ impl Predicate for EnoughResourcePredicate {
 #[derive(Debug, Default)]
 pub(crate) struct NetworkAwarePriority;
 
+#[derive(Debug, Default)]
+pub(crate) struct WorkloadNetworkAwarePriority;
+
+#[async_trait]
 impl Priority for NetworkAwarePriority {
-    fn priority(
+    async fn priority(
         &self,
+        client: Client,
         node_name: &[String],
-        node_resource_map: &HashMap<String, NodeResource>,
         pod: &Pod,
         bw_map: &HashMap<(String, String), u32>,
         choice: &mut HashMap<String, u32>,
@@ -83,15 +90,12 @@ impl Priority for NetworkAwarePriority {
             m.insert(node.to_string(), 0);
         }
 
-        let nr_node = node_resource_map.keys().len();
-        let uuid = pod
-            .clone()
-            .metadata
-            .labels
-            .unwrap()
-            .get("spark-uuid")
-            .unwrap()
-            .clone();
+        let nodes: Api<Node> = Api::all(client.clone());
+        let lp = ListParams::default();
+        let node_list = nodes.list(&lp).await.expect("failed to list pods");
+        let nr_node = node_list.items.len();
+
+        let uuid = get_pod_uuid(pod);
 
         let this_choice = choice.get(&uuid);
         let mut c = match this_choice {
@@ -108,9 +112,10 @@ impl Priority for NetworkAwarePriority {
 
         // find the lowest bw >= choice
         let mut all_bws = vec![];
-        for node in node_resource_map.keys() {
-            let bw_to_storage = bw_map.get(&(node.to_string(), "xyji".to_string())).unwrap();
-            all_bws.push((node.to_string(), *bw_to_storage));
+        for node in node_list {
+            let name = node.metadata.name.unwrap();
+            let bw_to_storage = bw_map.get(&(name.clone(), "xyji".to_string())).unwrap();
+            all_bws.push((name, *bw_to_storage));
         }
         all_bws.sort_by(|a, b| a.1.cmp(&b.1));
 
@@ -128,6 +133,7 @@ impl Priority for NetworkAwarePriority {
         }
         node_with_index.sort_by(|a, b| a.1.cmp(&b.1));
 
+        // make decision based on sorted nodes, ascending
         let mut flag = false;
         for (i, node) in node_with_index.iter().enumerate() {
             if i >= c as usize {
@@ -137,13 +143,14 @@ impl Priority for NetworkAwarePriority {
                 break;
             }
         }
-
+        // if not found chose the largest one
         if !flag {
             let node = node_with_index.last().unwrap();
             m.insert(node.0.to_string(), 100);
             c = ((node.1 + 1) % nr_node) as u32;
         }
 
+        // update the choice
         let _choice = choice.get_mut(&uuid);
         match _choice {
             Some(ch) => *ch = c,
@@ -154,6 +161,128 @@ impl Priority for NetworkAwarePriority {
 
         m
     }
+}
+
+#[async_trait]
+impl Priority for WorkloadNetworkAwarePriority {
+    async fn priority(
+        &self,
+        client: Client,
+        node_name: &[String],
+        pod: &Pod,
+        bw_map: &HashMap<(String, String), u32>,
+        choice: &mut HashMap<String, u32>,
+    ) -> HashMap<String, u32> {
+        let mut m = HashMap::new();
+        for node in node_name {
+            m.insert(node.to_string(), 0);
+        }
+
+        let nodes: Api<Node> = Api::all(client.clone());
+        let lp = ListParams::default();
+        let node_list = nodes.list(&lp).await.expect("failed to list pods");
+        let nr_node = node_list.items.len();
+
+        let uuid = get_pod_uuid(pod);
+        let workload_type = get_pod_workload_type(pod);
+
+        let this_choice = choice.get(&uuid);
+        let mut c = match this_choice {
+            Some(c) => *c,
+            None => 0,
+        };
+
+        // candidate bws
+        let mut bws = vec![];
+        for node in node_name {
+            let bw_to_storage = bw_map.get(&(node.to_string(), "xyji".to_string())).unwrap();
+            bws.push((node.to_string(), *bw_to_storage));
+        }
+
+        // find the lowest bw >= choice
+        let mut all_bws = vec![];
+        for node in node_list {
+            let name = node.metadata.name.unwrap();
+            let bw_to_storage = bw_map.get(&(name.clone(), "xyji".to_string())).unwrap();
+            all_bws.push((name, *bw_to_storage));
+        }
+        all_bws.sort_by(|a, b| a.1.cmp(&b.1));
+
+        if workload_type == DEFAULT_COMPUTE_WORKLOAD {
+            for bw in &all_bws {
+                if node_name.contains(&bw.0) {
+                    println!("a compute workload, pod: {:?} bounded to node: {}", pod.metadata.name, bw.0);
+                    m.insert(bw.0.clone(), 100);
+                    return m;
+                }
+            }
+        }
+
+        let mut node_with_index = vec![];
+        for bw in bws {
+            // find the bw's index in all_bws
+            let mut index = 0;
+            for (i, all_bw) in all_bws.iter().enumerate() {
+                if bw.0 == all_bw.0 {
+                    index = i;
+                    break;
+                }
+            }
+            node_with_index.push((bw.0, index));
+        }
+        node_with_index.sort_by(|a, b| a.1.cmp(&b.1));
+
+        // make decision based on sorted nodes, ascending
+        let mut flag = false;
+        for (i, node) in node_with_index.iter().enumerate() {
+            if i >= c as usize {
+                flag = true;
+                m.insert(node.0.to_string(), 100);
+                c = ((i + 1) % nr_node) as u32;
+                break;
+            }
+        }
+        // if not found chose the largest one
+        if !flag {
+            let node = node_with_index.last().unwrap();
+            m.insert(node.0.to_string(), 100);
+            c = ((node.1 + 1) % nr_node) as u32;
+        }
+
+        // update the choice
+        let _choice = choice.get_mut(&uuid);
+        match _choice {
+            Some(ch) => *ch = c,
+            None => {
+                choice.insert(uuid, c);
+            }
+        };
+
+        m
+    }
+}
+
+
+fn get_pod_workload_type(pod: &Pod) -> String {
+    pod
+        .clone()
+        .metadata
+        .labels
+        .unwrap()
+        .get(DEFAULT_WORKLOAD_TYPE_KEY)
+        .unwrap()
+        .clone()
+}
+
+fn get_pod_uuid(pod: &Pod) -> String {
+    pod
+        .clone()
+        .metadata
+        .labels
+        .unwrap()
+        .get(DEFAULT_UUID_KEY)
+        .unwrap()
+        .clone()
 }
 
 async fn get_remaining_resources(

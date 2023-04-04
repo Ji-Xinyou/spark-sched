@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use futures::TryStreamExt;
-use k8s_openapi::api::core::v1::{Node, Pod};
+use k8s_openapi::api::core::v1::Pod;
 use kube::Api;
 use kube::{
     api::ListParams,
@@ -8,38 +8,18 @@ use kube::{
     Client,
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::ops::{EmitParameters, PodBindParameters};
-use crate::predprio::{EnoughResourcePredicate, Predicate, Priority, quantity_to_millicores, quantity_to_kibytes};
+use crate::predprio::{
+    quantity_to_kibytes, quantity_to_millicores, EnoughResourcePredicate, Predicate, Priority,
+};
 
 const SCHEDULER_NAME: &str = "spark-sched";
 const SPARK_NAMESPACE: &str = "spark";
-const DEFAULT_MASTER_NODE_NAME: &str = "node02";
-
-/// The allocation scene, the semantic is that #nr pods are allocated to #node
-#[derive(Debug, Default, Clone)]
-pub(crate) struct Alloc {
-    pub(crate) node_name: String,
-    pub(crate) nr: i32,
-}
-
-#[derive(Debug, Default, Clone)]
-pub(crate) struct NodeResource {
-    pub(crate) cpu: u32,
-    pub(crate) mem_kb: u32,
-}
-
-/// use uuid as key, the vector of alloc is explained below
-///
-/// Each spark job has a uuid string with key spark-uuid (can be seen in spark-submmiter/src/cmd.rs)
-/// with the uuid string as key, you can query the allocation history of the job.
-/// The Scheduler bookkeeps the allocation history, each entry of Vec<Alloc> corresponds to a node
-/// and the number of pods allocated to it.
-pub(crate) type SchedHistory = HashMap<String, Vec<Alloc>>;
 
 pub(crate) struct Scheduler {
     pub(crate) client: Client,
@@ -50,25 +30,24 @@ pub(crate) struct Scheduler {
 
     pub(crate) bandwidth_map: HashMap<(String, String), u32>,
     pub(crate) next_choice: RwLock<HashMap<String, u32>>,
-
-    pub(crate) node_resource_map: Mutex<HashMap<String, NodeResource>>,
 }
 
 impl Scheduler {
-    pub async fn new(client: Client) -> Self {
-        let node_resource_map = Mutex::new(HashMap::new());
+    pub async fn new(client: Client, args: crate::Args) -> Self {
+        let prio: Arc<dyn Priority> = match args.prio.as_str() {
+            "network" => Arc::new(crate::predprio::NetworkAwarePriority::default()),
+            "workload" => Arc::new(crate::predprio::WorkloadNetworkAwarePriority::default()),
+            _ => panic!("unknown priority"),
+        };
 
         let sched = Scheduler {
             client,
             namespace: SPARK_NAMESPACE.to_string(),
             predicate: Arc::new(EnoughResourcePredicate::default()),
-            priority: Arc::new(crate::predprio::NetworkAwarePriority::default()),
+            priority: prio,
             bandwidth_map: hard_coded_network_bandwidth_map(),
             next_choice: RwLock::new(HashMap::new()),
-            node_resource_map,
         };
-
-        sched.renew_resource_map().await;
 
         sched
     }
@@ -87,16 +66,12 @@ impl Scheduler {
             let pod = rx.recv().await.expect("the pod queue is closed");
             let sched = sched.clone();
 
-            let tx_c = tx_c.clone();
-            tokio::spawn(async move {
-                let ok = sched.sched_pod(&pod).await;
-                println!("pod scheduled success??: {}\n", ok);
-                // if failed to schedule, put it back to the rx
-                if !ok {
-                    let tx = tx_c.clone();
-                    tx.send(pod).unwrap();
-                }
-            });
+            let ok = sched.sched_pod(&pod).await;
+            println!("pod scheduled success??: {}\n", ok);
+
+            if !ok {
+                tx_c.send(pod).unwrap();
+            }
         }
     }
 
@@ -128,7 +103,7 @@ impl Scheduler {
         tokio::spawn(async move {
             let sched = self.clone();
             loop {
-                sched.renew_resource_map_if_no_pod().await;
+                sched.renew_if_no_pod().await;
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             }
         });
@@ -158,7 +133,7 @@ impl Scheduler {
         );
         println!("{}", &message.trim_end());
 
-        let uuid = pod
+        let _uuid = pod
             .clone()
             .metadata
             .labels
@@ -187,69 +162,15 @@ impl Scheduler {
 
 // utilities
 impl Scheduler {
-    async fn renew_resource_map_if_no_pod(&self) {
+    async fn renew_if_no_pod(&self) {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
         let pods = pods.list(&ListParams::default()).await.unwrap().items;
         if pods.is_empty() {
-            self.renew_resource_map().await;
             self.next_choice.write().await.clear();
-            println!("Node resource map renewed!");
-        }
-    }
-
-    async fn renew_resource_map(&self) {
-        // Get a node list
-        let node_api: Api<Node> = Api::all(self.client.clone());
-        let nodes = node_api.list(&ListParams::default()).await.unwrap().items;
-        let mut map = self.node_resource_map.lock().await;
-        for n in nodes {
-            let name = n.metadata.name.unwrap();
-            let mut cpu = n
-                .status
-                .as_ref()
-                .and_then(|status| {
-                    status
-                        .allocatable
-                        .as_ref()
-                        .and_then(|allocatable| allocatable.get("cpu").map(|cpu| &cpu.0))
-                })
-                .expect("(ABNORMAL) failed to get cpu capacity")
-                .parse::<u32>()
-                .unwrap();
-
-            // HACK: master node reserves more..
-            if &name == DEFAULT_MASTER_NODE_NAME {
-                cpu -= 2;
-            }
-
-            let mem_kb =
-                n.status
-                    .as_ref()
-                    .and_then(|status| {
-                        status.allocatable.as_ref().and_then(|allocatable| {
-                            allocatable.get("memory").map(|memory| &memory.0)
-                        })
-                    })
-                    .expect("(ABNORMAL) failed to get memory capacity")
-                    .chars()
-                    .filter(|c| c.is_numeric())
-                    .collect::<String>()
-                    .parse::<u32>()
-                    .unwrap();
-
-            map.insert(
-                name,
-                NodeResource {
-                    cpu: cpu - 1,
-                    mem_kb: mem_kb - 5 * 1024 * 1024,
-                },
-            );
         }
     }
 
     async fn eval_and_bind(&self, pod: &Pod) -> Result<String> {
-        let node_resource_map = self.node_resource_map.lock().await;
-
         let pod_resource = pod_resource(pod);
         let filtered_node_names = self.predicate.judge(&self.client, pod_resource).await;
 
@@ -262,12 +183,9 @@ impl Scheduler {
         }
 
         let mut choice = self.next_choice.write().await;
-        let priorities = self.prioritize(
-            &filtered_node_names,
-            &node_resource_map,
-            pod,
-            &mut choice,
-        );
+        let priorities = self
+            .prioritize(&filtered_node_names, pod, &mut choice)
+            .await;
         let best_node = self.find_best_node(&priorities);
 
         // bind the pod to the node
@@ -285,37 +203,31 @@ impl Scheduler {
             .as_ref()
             .expect("empty pod namespace");
 
-        match bind_result {
-            Ok(_) => {
-                // update node resource map
-                // node_resource_map.get_mut(&best_node).unwrap().cpu -= pod_resource.cpu;
-                // node_resource_map.get_mut(&best_node).unwrap().mem_kb -= pod_resource.mem_kb;
-            }
-            Err(e) => {
-                println!(
-                    "failed to bind pod {}/{} to node {}: {}",
-                    &pod_namespace, &pod_name, &best_node, e
-                );
-            }
+        if let Err(e) = bind_result {
+            println!(
+                "failed to bind pod {}/{} to node {}: {}",
+                &pod_namespace, &pod_name, &best_node, e
+            );
         }
 
         Ok(best_node)
     }
 
-    fn prioritize(
+    async fn prioritize(
         &self,
         node_names: &[String],
-        node_resource_map: &HashMap<String, NodeResource>,
         pod: &Pod,
         choice: &mut HashMap<String, u32>,
     ) -> HashMap<String, u32> {
-        self.priority.priority(
-            node_names,
-            node_resource_map,
-            pod,
-            &self.bandwidth_map.clone(),
-            choice,
-        )
+        self.priority
+            .priority(
+                self.client.clone(),
+                node_names,
+                pod,
+                &self.bandwidth_map.clone(),
+                choice,
+            )
+            .await
     }
 
     fn find_best_node(&self, priorities: &HashMap<String, u32>) -> String {
@@ -331,13 +243,15 @@ impl Scheduler {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct PodResource {
+    pub(crate) name: String,
     pub(crate) millicore: u64,
     pub(crate) mem_kb: u64,
 }
 
 pub(crate) fn pod_resource(pod: &Pod) -> PodResource {
+    let name = pod.metadata.name.as_ref().unwrap().clone();
     let pod_req = pod
         .spec
         .as_ref()
@@ -353,14 +267,12 @@ pub(crate) fn pod_resource(pod: &Pod) -> PodResource {
         .unwrap();
 
     let cpu = pod_req.get("cpu").unwrap();
-    let mem_kb = pod_req
-        .get("memory")
-        .unwrap();
+    let mem_kb = pod_req.get("memory").unwrap();
 
-    let millicore= quantity_to_millicores(cpu.clone()).unwrap();
+    let millicore = quantity_to_millicores(cpu.clone()).unwrap();
     let mem_kb = quantity_to_kibytes(mem_kb.clone()).unwrap();
 
-    PodResource { millicore, mem_kb }
+    PodResource { name, millicore, mem_kb }
 }
 
 pub(crate) fn hard_coded_network_bandwidth_map() -> HashMap<(String, String), u32> {
