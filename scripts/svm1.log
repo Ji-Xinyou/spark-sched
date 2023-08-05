@@ -1,0 +1,66 @@
+profiling
+
+Running 1 workloads
+running nexec 1
+One workload exits, elapsed time: 71052 ms
+cleaning up
+running nexec 2
+One workload exits, elapsed time: 74674 ms
+cleaning up
+running nexec 3
+One workload exits, elapsed time: 80325 ms
+cleaning up
+running nexec 4
+One workload exits, elapsed time: 87645 ms
+cleaning up
+running nexec 5
+One workload exits, elapsed time: 86563 ms
+cleaning up
+running nexec 6
+One workload exits, elapsed time: 90586 ms
+cleaning up
+running nexec 7
+One workload exits, elapsed time: 97538 ms
+cleaning up
+running nexec 8
+One workload exits, elapsed time: 92269 ms
+cleaning up
+running nexec 9
+One workload exits, elapsed time: 95834 ms
+cleaning up
+running nexec 10
+One workload exits, elapsed time: 92304 ms
+cleaning up
+running nexec 11
+One workload exits, elapsed time: 94970 ms
+cleaning up
+running nexec 12
+One workload exits, elapsed time: 100960 ms
+cleaning up
+running nexec 13
+One workload exits, elapsed time: 103614 ms
+cleaning up
+running nexec 14
+One workload exits, elapsed time: 101859 ms
+cleaning up
+running nexec 15
+One workload exits, elapsed time: 100894 ms
+cleaning up
+running nexec 16
+One workload exits, elapsed time: 96460 ms
+cleaning up
+running nexec 17
+One workload exits, elapsed time: 99902 ms
+cleaning up
+running nexec 18
+One workload exits, elapsed time: 110405 ms
+cleaning up
+running nexec 19
+One workload exits, elapsed time: 117304 ms
+cleaning up
+running nexec 20
+One workload exits, elapsed time: 296604 ms
+cleaning up
+running nexec 21
+One workload exits, elapsed time: 330529 ms
+cleaning up

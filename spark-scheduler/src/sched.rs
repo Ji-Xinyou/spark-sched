@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use crate::ops::{EmitParameters, PodBindParameters};
 use crate::predprio::{
-    quantity_to_kibytes, quantity_to_millicores, EnoughResourcePredicate, Predicate, Priority, get_pod_uuid,
+    get_pod_uuid, quantity_to_kibytes, quantity_to_millicores, EnoughResourcePredicate, Predicate,
+    Priority,
 };
 
 const SCHEDULER_NAME: &str = "spark-sched";
@@ -35,7 +36,6 @@ pub(crate) struct Scheduler {
 
 impl Scheduler {
     pub async fn new(client: Client) -> Self {
-
         let sched = Scheduler {
             client,
             namespace: SPARK_NAMESPACE.to_string(),
@@ -228,12 +228,7 @@ impl Scheduler {
         choice: &mut HashMap<String, u32>,
     ) -> HashMap<String, u32> {
         self.priority
-            .priority(
-                self.client.clone(),
-                node_names,
-                pod,
-                choice,
-            )
+            .priority(self.client.clone(), node_names, pod, choice)
             .await
     }
 
@@ -279,7 +274,11 @@ pub(crate) fn pod_resource(pod: &Pod) -> PodResource {
     let millicore = quantity_to_millicores(cpu.clone()).unwrap();
     let mem_kb = quantity_to_kibytes(mem_kb.clone()).unwrap();
 
-    PodResource { name, millicore, mem_kb }
+    PodResource {
+        name,
+        millicore,
+        mem_kb,
+    }
 }
 
 pub(crate) fn hard_coded_network_bandwidth_map() -> HashMap<(String, String), u32> {

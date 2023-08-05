@@ -43,7 +43,10 @@ impl Predicate for EnoughResourcePredicate {
         let lp = ListParams::default();
         let node_list = nodes.list(&lp).await.expect("failed to list pods");
 
-        println!("|pod {}| request milicores: {}, mem_kib: {}", pod_resource.name, pod_resource.millicore, pod_resource.mem_kb);
+        println!(
+            "|pod {}| request milicores: {}, mem_kib: {}",
+            pod_resource.name, pod_resource.millicore, pod_resource.mem_kb
+        );
         for node in node_list {
             let node_name = node.metadata.name.unwrap();
             let (remaining_milicores, remaining_mem_ki) =
@@ -154,10 +157,8 @@ impl Priority for WorkloadNetworkAwarePriority {
     }
 }
 
-
 fn get_pod_workload_type(pod: &Pod) -> String {
-    pod
-        .clone()
+    pod.clone()
         .metadata
         .labels
         .unwrap()
@@ -167,8 +168,7 @@ fn get_pod_workload_type(pod: &Pod) -> String {
 }
 
 pub fn get_pod_uuid(pod: &Pod) -> String {
-    pod
-        .clone()
+    pod.clone()
         .metadata
         .labels
         .unwrap()
